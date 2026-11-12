@@ -212,6 +212,12 @@ struct SynthIntelPass : public ScriptPass {
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
+			run("opt_pmux_context");
+			run("opt_pmux_arith");
+			run("opt_pmux_factor");
+			run("opt_pmux_state");
+			run("opt_pmux_rel");
+			run("opt_pmux_select");
 			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
 			run("opt_expr");
 			run("opt_clean");
@@ -263,7 +269,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt -fast");
 			run("autoname");

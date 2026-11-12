@@ -75,6 +75,24 @@ yosys_pass(muxpack
 yosys_pass(opt_balance_tree
 	opt_balance_tree.cc
 )
+yosys_pass(opt_pmux_context
+	opt_pmux_context.cc
+)
+yosys_pass(opt_pmux_arith
+	opt_pmux_arith.cc
+)
+yosys_pass(opt_pmux_factor
+	opt_pmux_factor.cc
+)
+yosys_pass(opt_pmux_state
+	opt_pmux_state.cc
+)
+yosys_pass(opt_pmux_rel
+	opt_pmux_rel.cc
+)
+yosys_pass(opt_pmux_select
+	opt_pmux_select.cc
+)
 
 pmgen_command(peepopt
 	peepopt_shiftmul_right.pmg
@@ -91,3 +109,15 @@ yosys_pass(peepopt
 	peepopt.cc
 	${PMGEN_peepopt_OUTPUT}
 )
+
+# Link the coarse PMUX passes through synth_intel's peepopt dependency in a selective build.
+if (synth_intel IN_LIST YOSYS_COMPONENTS)
+	set_property(TARGET yosys_peepopt APPEND PROPERTY YOSYS_REQUIRES
+		opt_pmux_context
+		opt_pmux_arith
+		opt_pmux_factor
+		opt_pmux_state
+		opt_pmux_rel
+		opt_pmux_select
+	)
+endif()
