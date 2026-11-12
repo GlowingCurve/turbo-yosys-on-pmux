@@ -17,7 +17,8 @@ bool is_selection(Cell *cell)
 bool can_specialize(Cell *cell)
 {
 	return cell->type.in(ID($mux), ID($pmux), ID($pos), ID($not), ID($and), ID($or), ID($xor), ID($xnor), ID($add), ID($sub),
-			ID($eq), ID($ne), ID($logic_not), ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor));
+			ID($eq), ID($ne), ID($lt), ID($le), ID($gt), ID($ge), ID($logic_not), ID($logic_and), ID($logic_or),
+			ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor));
 }
 
 bool binary(SigBit bit)
@@ -151,6 +152,128 @@ struct ContextRewrite
 		return !binary(value) || (assume(left, value.data, depth) && assume(right, value.data, depth));
 	}
 
+	bool assume_unequal(const SigSpec &a, const SigSpec &b, int depth)
+	{
+		budget -= GetSize(a);
+		bool merges_unknown = consumer->type == ID($mux);
+		std::optional<std::pair<SigBit, State>> mismatch;
+		for (int i = 0; i < GetSize(a); ++i) {
+			auto left = a[i], right = b[i];
+			if (!merges_unknown) {
+				left = representative(left);
+				right = representative(right);
+			}
+			if ((!left.wire && !binary(left)) || (!right.wire && !binary(right)))
+				return true;
+			// 相同导线也可能使比较结果为 X，普通 $mux 仍会合并两路数据。
+			if (left == right && (!merges_unknown || binary(left)))
+				continue;
+			if (!left.wire)
+				std::swap(left, right);
+			if (!left.wire || !binary(right))
+				return true;
+			auto required = std::make_pair(left, right == State::S0 ? State::S1 : State::S0);
+			if (mismatch && *mismatch != required)
+				return true;
+			mismatch = required;
+		}
+		return !mismatch || assume(mismatch->first, mismatch->second, depth + 1);
+	}
+
+	SigBit implication_operand(SigBit bit)
+	{
+		// 对 $mux，组合分支事实不能证明选择信号为 X 时某个操作数仍是常量。
+		return consumer->type == ID($mux) ? bit : assumed(bit);
+	}
+
+	SigBit operand_bit(Cell *cell, IdString port, int offset, bool sign) const
+	{
+		const auto &operand = cell->getPort(port);
+		if (offset < GetSize(operand))
+			return index.sigmap(operand[offset]);
+		return sign && !operand.empty() ? index.sigmap(operand[GetSize(operand) - 1]) : SigBit(State::S0);
+	}
+
+	bool assume_reduction(const SigSpec &inputs, bool conjunction, bool required, int depth)
+	{
+		State value = required ? State::S1 : State::S0;
+		if (required == conjunction) {
+			for (auto input : inputs) {
+				if (budget <= 0)
+					break;
+				if (!assume(input, value, depth + 1))
+					return false;
+			}
+			return true;
+		}
+
+		if (GetSize(inputs) > budget)
+			return true;
+		budget -= GetSize(inputs);
+		std::optional<SigBit> remaining;
+		for (auto input : inputs) {
+			SigBit known = implication_operand(input);
+			if (known == value)
+				return true;
+			if (binary(known))
+				continue;
+			if (remaining && *remaining != input)
+				return true;
+			remaining = input;
+		}
+		return remaining && assume(*remaining, value, depth + 1);
+	}
+
+	bool assume_parity(const SigSpec &inputs, bool required, int depth)
+	{
+		if (GetSize(inputs) > budget)
+			return true;
+		budget -= GetSize(inputs);
+		SigSpec remaining;
+		for (auto input : inputs) {
+			SigBit known = implication_operand(input);
+			if (binary(known))
+				required ^= known == State::S1;
+			else if (!known.wire)
+				return false;
+			else if (GetSize(remaining) == 2)
+				return true;
+			else
+				remaining.append(input);
+		}
+		if (remaining.empty())
+			return !required;
+		if (GetSize(remaining) == 1)
+			return assume(remaining[0], required ? State::S1 : State::S0, depth + 1);
+		return required || assume_equal(remaining[0], remaining[1], depth + 1);
+	}
+
+	bool assume_logical(Cell *cell, bool required, int depth)
+	{
+		auto a = index.port(cell, ID::A), b = index.port(cell, ID::B);
+		if (GetSize(a) + GetSize(b) > budget)
+			return true;
+		if (cell->type == ID($logic_or)) {
+			a.append(b);
+			return assume_reduction(a, false, required, depth);
+		}
+		if (required)
+			return assume_reduction(a, false, true, depth) && assume_reduction(b, false, true, depth);
+
+		budget -= GetSize(a) + GetSize(b);
+		auto has_one = [&](const SigSpec &input) {
+		for (auto bit : input)
+			if (implication_operand(bit) == State::S1)
+				return true;
+		return false;
+		};
+		if (has_one(a))
+			return assume_reduction(b, false, false, depth);
+		if (has_one(b))
+			return assume_reduction(a, false, false, depth);
+		return true;
+	}
+
 	bool assume(SigBit bit, State value, int depth = 0)
 	{
 		if (budget <= 0 || depth > max_depth)
@@ -165,24 +288,32 @@ struct ContextRewrite
 		if (!source || !source->cell || source->port != ID::Y || source->cell == consumer)
 			return true;
 		auto cell = source->cell;
-		if (!cell->type.in(ID($not), ID($eq), ID($ne), ID($logic_not), ID($reduce_and), ID($reduce_or), ID($reduce_bool)))
-			return true;
-
-		if (cell->type == ID($not)) {
-			auto a = index.port(cell, ID::A);
-			a.extend_u0(source->offset + 1, signed_port(cell, ID::A_SIGNED));
-			return assume(a[source->offset], value == State::S1 ? State::S0 : State::S1, depth + 1);
+		auto type = cell->type;
+		bool required = value == State::S1;
+		if (type == ID($not)) {
+			auto a = operand_bit(cell, ID::A, source->offset, signed_port(cell, ID::A_SIGNED));
+			return assume(a, required ? State::S0 : State::S1, depth + 1);
 		}
+		if (type.in(ID($and), ID($or), ID($xor), ID($xnor))) {
+			bool sign = signed_port(cell, ID::A_SIGNED) && signed_port(cell, ID::B_SIGNED);
+			SigSpec inputs({operand_bit(cell, ID::A, source->offset, sign), operand_bit(cell, ID::B, source->offset, sign)});
+			if (type.in(ID($and), ID($or)))
+				return assume_reduction(inputs, type == ID($and), required, depth);
+			return assume_parity(inputs, required != (type == ID($xnor)), depth);
+		}
+		if (!type.in(ID($eq), ID($ne), ID($logic_not), ID($logic_and), ID($logic_or), ID($reduce_and), ID($reduce_or),
+				ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor)))
+			return true;
 		if (source->offset != 0)
-			return value == State::S0;
+			return !required;
 
-		if (cell->type.in(ID($eq), ID($ne))) {
-			if ((cell->type == ID($eq)) != (value == State::S1))
-				return true;
+		if (type.in(ID($eq), ID($ne))) {
 			auto comparison = index.comparison_operands(cell, budget);
 			if (!comparison)
 				return true;
 			const auto &[a, b] = *comparison;
+			if ((type == ID($eq)) != required)
+				return assume_unequal(a, b, depth);
 			for (int i = 0; i < GetSize(a) && budget > 0; i++) {
 				budget--;
 				if (!assume_equal(a[i], b[i], depth + 1))
@@ -190,17 +321,12 @@ struct ContextRewrite
 			}
 			return true;
 		}
-
-		bool implies_all = cell->type.in(ID($logic_not), ID($reduce_and)) == (value == State::S1);
-		State required = cell->type == ID($reduce_and) ? State::S1 : State::S0;
-		if (implies_all)
-			for (auto input : index.port(cell, ID::A)) {
-				if (budget <= 0)
-					break;
-				if (!assume(input, required, depth + 1))
-					return false;
-			}
-		return true;
+		if (type.in(ID($logic_and), ID($logic_or)))
+			return assume_logical(cell, required, depth);
+		auto input = index.port(cell, ID::A);
+		if (type.in(ID($reduce_xor), ID($reduce_xnor)))
+			return assume_parity(input, required != (type == ID($reduce_xnor)), depth);
+		return assume_reduction(input, type == ID($reduce_and), required != (type == ID($logic_not)), depth);
 	}
 
 	static bool binary_constant(const Value &value)
@@ -211,6 +337,13 @@ struct ContextRewrite
 	static bool zero(const Value &value)
 	{
 		return std::all_of(value.begin(), value.end(), [](const Bit &bit) { return bit.is(State::S0); });
+	}
+
+	static State logical_value(const Value &value)
+	{
+		if (std::any_of(value.begin(), value.end(), [](const Bit &bit) { return bit.is(State::S1); }))
+			return State::S1;
+		return zero(value) ? State::S0 : State::Sx;
 	}
 
 	static Const constant(const Value &value)
@@ -247,6 +380,27 @@ struct ContextRewrite
 		for (int i = 0; i < width; i++)
 			result.push_back({{}, node, i});
 		return result;
+	}
+
+	std::optional<Value> narrow_order(Cell *cell, Value a, Value b, int width)
+	{
+		bool sign = signed_port(cell, ID::A_SIGNED) && signed_port(cell, ID::B_SIGNED);
+		int operands_width = std::max(GetSize(a), GetSize(b));
+		extend(a, operands_width, sign);
+		extend(b, operands_width, sign);
+		int remaining = operands_width;
+		while (remaining > 0) {
+			const auto &left = a[remaining - 1], &right = b[remaining - 1];
+			if ((!left.is(State::S0) || !right.is(State::S0)) && (!left.is(State::S1) || !right.is(State::S1)))
+				break;
+			remaining--;
+		}
+		if (remaining == 0 || remaining == operands_width)
+			return std::nullopt;
+		// 去掉相同的常量最高位后，剩余部分按无符号比较。
+		a.resize(remaining);
+		b.resize(remaining);
+		return make_node(cell, std::move(a), std::move(b), {}, width, true);
 	}
 
 	std::optional<Value> simplify_equal(Cell *cell, Value a, Value b, int width)
@@ -351,6 +505,15 @@ struct ContextRewrite
 		}
 		if (binary_constant(a) && binary_constant(b))
 			return literal(CellTypes::eval(cell, constant(a), constant(b)));
+		if (cell->type.in(ID($logic_and), ID($logic_or))) {
+			State left = logical_value(a), right = logical_value(b);
+			State controlling = cell->type == ID($logic_and) ? State::S0 : State::S1;
+			if (left == controlling || right == controlling || (left != State::Sx && left == right)) {
+				Value result(width, Bit{State::S0});
+				result[0] = {left == controlling || right == controlling ? controlling : left};
+				return result;
+			}
+		}
 
 		bool sign = signed_port(cell, ID::A_SIGNED) && (!cell->hasPort(ID::B) || signed_port(cell, ID::B_SIGNED));
 		if (cell->type == ID($pos) || (cell->type.in(ID($add), ID($sub)) && zero(b))) {
@@ -436,6 +599,9 @@ struct ContextRewrite
 		if (!unchanged)
 			if (auto simplified = simplify(cell, a, b, s, GetSize(output)))
 				return std::move(*simplified);
+		if (!unchanged && cell->type.in(ID($lt), ID($le), ID($gt), ID($ge)))
+			if (auto narrowed = narrow_order(cell, a, b, GetSize(output)))
+				return std::move(*narrowed);
 		if (cell->type.in(ID($xor), ID($sub), ID($eq), ID($ne)))
 			if (auto simplified = simplify_equal(cell, a, b, GetSize(output)))
 				return std::move(*simplified);

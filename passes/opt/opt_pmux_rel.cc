@@ -370,49 +370,133 @@ class RelationWorker
 	struct SwapColumn {
 		int cell, offset;
 		std::vector<int> values;
+		std::vector<int> branch_values;
 	};
 
-	std::unique_ptr<PmuxRewrite> swap_outputs(const std::vector<Cell *> &cells, const PmuxEncoding &encoding,
-			PmuxSelectTree &tree, const std::vector<SwapColumn> &columns, int flip)
+	struct SwapPair {
+		int first, second, exception;
+	};
+
+	struct SwapPartialCodes {
+		const PmuxEncoding &encoding;
+		std::vector<Cell *> cells;
+		std::vector<PmuxPartialCode> codes;
+		std::optional<std::vector<std::vector<PmuxBranchChoice>>> branches;
+	};
+
+	static bool preserves_partial_swap(const SwapColumn &column, const SwapColumn &other,
+			const std::vector<PmuxBranchChoice> &choices, const std::vector<int> &affected, int low, int high)
 	{
-		dict<std::vector<int>, std::vector<int>> groups;
-		for (int col = 0; col < GetSize(columns); ++col)
-			groups[columns[col].values].push_back(col);
+		for (int row : affected) {
+			const auto choice = choices[row];
+			if (choice.first == -2)
+				continue;
+			// 交换位未知时，局部修正和外层交换可能选中对方在例外编码的数据。
+			auto preserves = [&](int value) {
+				return value == column.branch_values[choice.first + 1] ||
+					(choice.second != -2 && value == column.branch_values[choice.second + 1]);
+			};
+			if (!preserves(other.values[low]) || !preserves(other.values[high]))
+				return false;
+		}
+		return true;
+	}
+
+	static std::vector<SwapPair> swap_pairs(const std::vector<SwapColumn> &columns, int mask, SwapPartialCodes *partial)
+	{
+		int rows = GetSize(columns.front().values);
+		std::vector<SwapPair> pairs;
 		pool<int> used;
+		int budget = pmux_max_table_bits;
+		for (int low = partial ? 0 : -1; low < (partial ? rows : 0); ++low) {
+			if (low >= 0 && (low & mask))
+				continue;
+			int high = low | mask;
+			std::vector<int> affected;
+			if (partial)
+				for (int row = 0; row < GetSize(partial->codes); ++row) {
+					const auto &code = partial->codes[row];
+					unsigned fixed = code.zero | code.one;
+					if (!(fixed & mask) && (unsigned(low) & fixed) == code.one)
+						affected.push_back(row);
+				}
+			auto key = [&](const SwapColumn &column, int flip) {
+				std::vector<int> result;
+				result.reserve(rows);
+				for (int row = 0; row < rows; ++row)
+					if (row != low && row != high)
+						result.push_back(column.values[row ^ flip]);
+				return result;
+			};
+			dict<std::vector<int>, std::vector<int>> groups;
+			for (int col = 0; col < GetSize(columns); ++col)
+				if (!used.count(col))
+					groups[key(columns[col], 0)].push_back(col);
+			for (int col = 0; col < GetSize(columns); ++col) {
+				if (used.count(col))
+					continue;
+				const auto &a = columns[col];
+				auto partners = groups.find(key(a, mask));
+				if (partners == groups.end() || (!partial && std::binary_search(partners->second.begin(), partners->second.end(), col)))
+					continue;
+				for (int partner : partners->second) {
+					if (partner == col || used.count(partner))
+					continue;
+					const auto &b = columns[partner];
+					if (partial) {
+						if ((budget -= 1 + GetSize(affected)) < 0)
+							return pairs;
+						if (a.values[low] == b.values[high] && a.values[high] == b.values[low])
+							continue;
+						if (!partial->branches)
+							partial->branches = partial->encoding.partial_branches(partial->cells);
+						const auto &branches = *partial->branches;
+						if (branches.empty())
+							return pairs;
+						if (!preserves_partial_swap(a, b, branches[a.cell], affected, low, high) ||
+								!preserves_partial_swap(b, a, branches[b.cell], affected, low, high))
+						continue;
+				}
+					used.insert(col);
+					used.insert(partner);
+					pairs.push_back({col, partner, low});
+					break;
+			}
+			}
+		}
+		return pairs;
+	}
+
+	std::unique_ptr<PmuxRewrite> swap_outputs(const std::vector<Cell *> &cells, const PmuxEncoding &encoding,
+			PmuxSelectTree &tree, const std::vector<SwapColumn> &columns, int flip, SwapPartialCodes *partial = nullptr)
+	{
 		pool<Cell *> replaced;
-		std::vector<int> controls, roots;
+		std::vector<int> controls, natural_order, roots, reference;
 		std::vector<pool<int>> offsets(cells.size());
 		pool<SigBit> inputs, outputs;
 		SigSpec swap_y;
 		bool shares_selection = false;
-		for (int control = 0; control < GetSize(encoding.controls); ++control)
+		if (partial)
+			controls.push_back(flip);
+		for (int control = 0; control < GetSize(encoding.controls); ++control) {
+			natural_order.push_back(control);
 			if (control != flip)
 				controls.push_back(control);
-		for (int col = 0; col < GetSize(columns); ++col) {
-			if (used.count(col))
-				continue;
-			const auto &a = columns[col];
-			int mask = 1 << flip;
-			std::vector<int> reversed;
-			for (int row = 0; row < GetSize(a.values); ++row)
-				reversed.push_back(a.values[row ^ mask]);
-			if (reversed == a.values)
-				continue;
-			auto partners = groups.find(reversed);
-			if (partners == groups.end())
-				continue;
-			auto partner = std::find_if(partners->second.begin(), partners->second.end(), [&](int id) { return !used.count(id); });
-			if (partner == partners->second.end())
-				continue;
-			const auto &b = columns[*partner];
-			used.insert(col);
-			used.insert(*partner);
+		}
+		int mask = 1 << flip;
+		for (const auto &pair : swap_pairs(columns, mask, partial)) {
+			const auto &a = columns[pair.first];
+			const auto &b = columns[pair.second];
 			std::vector<int> low_a, low_b;
 			for (int row = 0; row < GetSize(a.values); ++row) {
 				if (row & mask)
 					continue;
 				low_a.push_back(a.values[row]);
 				low_b.push_back(b.values[row]);
+				if (partial) {
+					low_a.push_back(row == pair.exception ? b.values[row | mask] : a.values[row]);
+					low_b.push_back(row == pair.exception ? a.values[row | mask] : b.values[row]);
+				}
 			}
 			shares_selection |= std::adjacent_find(low_a.begin(), low_a.end(), std::not_equal_to<int>{}) != low_a.end() ||
 					std::adjacent_find(low_b.begin(), low_b.end(), std::not_equal_to<int>{}) != low_b.end();
@@ -421,14 +505,16 @@ class RelationWorker
 			int level = GetSize(controls);
 			roots.push_back(tree.select(flip, level, left, right));
 			roots.push_back(tree.select(flip, level, right, left));
-			for (auto column : {a, b}) {
-				auto cell = cells[column.cell];
-				swap_y.append(index.port(cell, ID::Y)[column.offset]);
+			for (auto column : {&a, &b}) {
+				if (partial)
+					reference.push_back(tree.column(column->values, natural_order));
+				auto cell = cells[column->cell];
+				swap_y.append(index.port(cell, ID::Y)[column->offset]);
 				replaced.insert(cell);
-				offsets[column.cell].insert(column.offset);
+				offsets[column->cell].insert(column->offset);
 			}
 		}
-		if (roots.empty())
+		if (roots.empty() || (partial && tree.mux_bits(roots) >= tree.mux_bits(reference)))
 			return nullptr;
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "encoded_output_swap");
 		inputs = tree.inputs(roots);
@@ -525,7 +611,7 @@ class RelationWorker
 			if (GetSize(columns) + width > pmux_max_table_bits / rows)
 				break;
 			for (int offset = 0; offset < width; ++offset) {
-				auto &column = columns.emplace_back(SwapColumn{i, offset, {}});
+				auto &column = columns.emplace_back(SwapColumn{i, offset, {}, {}});
 				for (int row = 0; row < rows; ++row) {
 					int branch = tables[i][row];
 					SigBit bit = branch < 0 ? a[offset] : b[branch * width + offset];
@@ -533,10 +619,27 @@ class RelationWorker
 				}
 			}
 		}
-		if (GetSize(columns) >= 2)
-			for (int flip = 0; flip < GetSize(encoding.controls); ++flip)
-				if (apply(swap_outputs(cells, encoding, tree, columns, flip)))
-					return true;
+		if (GetSize(columns) < 2)
+			return false;
+		for (int flip = 0; flip < GetSize(encoding.controls); ++flip)
+			if (apply(swap_outputs(cells, encoding, tree, columns, flip)))
+				return true;
+		if (GetSize(encoding.controls) < 3)
+			return false;
+	SwapPartialCodes partial{encoding, {cells.begin(), cells.begin() + columns.back().cell + 1}, encoding.partial_codes(), std::nullopt};
+		PmuxSelectTree raw_tree(index, encoding);
+		for (auto &column : columns) {
+			auto cell = cells[column.cell];
+		const auto &a = cell->getPort(ID::A), &b = cell->getPort(ID::B);
+		column.branch_values.push_back(raw_tree.literal(index.sigmap(a[column.offset])));
+			for (int offset = column.offset; offset < GetSize(b); offset += GetSize(a))
+			column.branch_values.push_back(raw_tree.literal(index.sigmap(b[offset])));
+			for (int row = 0; row < rows; ++row)
+				column.values[row] = column.branch_values[tables[column.cell][row] + 1];
+		}
+		for (int flip = 0; flip < GetSize(encoding.controls); ++flip)
+			if (apply(swap_outputs(cells, encoding, raw_tree, columns, flip, &partial)))
+				return true;
 		return false;
 	}
 
@@ -580,6 +683,7 @@ struct OptPmuxRelPass : Pass {
 	{
 		log("    opt_pmux_rel [selection]\n\n");
 		log("Share selection outputs related by a fixed XOR or a swap under one control bit.\n");
+		log("A swap can have one exceptional pair of encodings, corrected by local muxes.\n");
 	}
 
 	void execute(std::vector<std::string> args, Design *design) override

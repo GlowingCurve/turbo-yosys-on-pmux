@@ -46,6 +46,18 @@ class PmuxEncoding
 		}
 	};
 
+	static uint64_t mux_truth(uint64_t a, uint64_t b, uint64_t select)
+	{
+		return (~select & a) | (select & b);
+	}
+
+	static TernaryTruth mux_truth(const TernaryTruth &a, const TernaryTruth &b, const TernaryTruth &select)
+	{
+		// 选择信号未知时，两路相同的已知值仍能确定输出。
+		return {(select.zero & a.zero) | (select.one & b.zero) | (a.zero & b.zero),
+			(select.zero & a.one) | (select.one & b.one) | (a.one & b.one)};
+	}
+
 	static const std::array<TernaryTruth, pmux_max_controls> &ternary_patterns()
 	{
 		static const auto result = [] {
@@ -117,13 +129,13 @@ class PmuxEncoding
 		if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
 			return comparison<Truth>(cell, read);
 		auto a = index.port(cell, ID::A);
-		if (GetSize(a) > pmux_max_rows)
-			return std::nullopt;
-		if (cell->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor))) {
-			bool is_and = cell->type == ID($reduce_and);
-			bool is_xor = cell->type.in(ID($reduce_xor), ID($reduce_xnor));
+		auto reduce = [&](const SigSpec &inputs, IdString type) -> std::optional<Truth> {
+			if (GetSize(inputs) > pmux_max_rows)
+				return std::nullopt;
+			bool is_and = type == ID($reduce_and);
+			bool is_xor = type.in(ID($reduce_xor), ID($reduce_xnor));
 			Truth result = is_and ? ~Truth{} : Truth{};
-			for (auto bit : a) {
+			for (auto bit : inputs) {
 				auto input = read(bit, true);
 				if (!input)
 					return std::nullopt;
@@ -134,7 +146,18 @@ class PmuxEncoding
 				else
 					result = result | *input;
 			}
-			return cell->type == ID($reduce_xnor) ? ~result : result;
+			return type == ID($reduce_xnor) ? ~result : result;
+		};
+		if (cell->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor)))
+			return reduce(a, cell->type);
+		if (cell->type.in(ID($logic_and), ID($logic_or))) {
+			auto lhs = reduce(a, ID($reduce_or));
+			if (!lhs)
+				return std::nullopt;
+			auto rhs = reduce(index.port(cell, ID::B), ID($reduce_or));
+			if (!rhs)
+				return std::nullopt;
+			return cell->type == ID($logic_and) ? *lhs & *rhs : *lhs | *rhs;
 		}
 		if (GetSize(a) != 1)
 			return std::nullopt;
@@ -149,6 +172,15 @@ class PmuxEncoding
 		auto rhs = read(b[0], true);
 		if (!rhs)
 			return std::nullopt;
+		if (cell->type == ID($mux)) {
+			auto s = index.port(cell, ID::S);
+			if (GetSize(s) != 1)
+				return std::nullopt;
+			auto select = read(s[0], true);
+			if (!select)
+				return std::nullopt;
+			return mux_truth(*lhs, *rhs, *select);
+		}
 		if (cell->type == ID($and))
 			return *lhs & *rhs;
 		if (cell->type == ID($or))
@@ -205,7 +237,8 @@ public:
 			return literal(bit);
 		auto cell = source->cell;
 		if (!cell->type.in(ID($eq), ID($ne), ID($logic_not), ID($reduce_or), ID($reduce_bool), ID($reduce_and),
-				ID($reduce_xor), ID($reduce_xnor), ID($not), ID($and), ID($or), ID($xor), ID($xnor)))
+				ID($reduce_xor), ID($reduce_xnor), ID($not), ID($and), ID($or), ID($xor), ID($xnor),
+				ID($logic_and), ID($logic_or), ID($mux)))
 			return literal(bit);
 		if (depth == 0 || GetSize(cells) >= 128 || !active.insert(bit).second)
 			return std::nullopt;

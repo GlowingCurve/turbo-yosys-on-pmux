@@ -22,6 +22,8 @@ class PmuxSelectTree
 	dict<SigBit, int> literals;
 	dict<std::tuple<int, Op, int, int, int>, int> operations;
 	dict<std::pair<SigBit, int>, int> specialized;
+	dict<int, bool> z_free;
+	dict<int, std::optional<PmuxCoarseIndex::Port>> literal_inverters;
 	pool<SigBit> active;
 	int visits_left = 65536;
 
@@ -67,6 +69,52 @@ class PmuxSelectTree
 		return operation(op, a, b, -1, std::max(data_stage(a), data_stage(b)) + 1);
 	}
 
+	bool cannot_output_z(int id)
+	{
+		auto cached = z_free.find(id);
+		if (cached != z_free.end())
+			return cached->second;
+		const auto &node = nodes[id];
+		bool proven = true;
+		if (node.op == Op::mux) {
+			proven = cannot_output_z(node.a) && cannot_output_z(node.b);
+		} else if (node.op == Op::literal) {
+			if (node.bit.wire) {
+				auto source = index.source(node.bit);
+				proven = source && source->port == ID::Y &&
+						source->cell->type.in(ID($not), ID($and), ID($or), ID($xor), ID($xnor), ID($logic_not),
+							ID($logic_and), ID($logic_or), ID($reduce_bool), ID($reduce_or), ID($reduce_and),
+							ID($reduce_xor), ID($reduce_xnor), ID($eq), ID($ne), ID($lt), ID($le), ID($gt), ID($ge));
+			} else {
+				proven = node.bit != State::Sz;
+			}
+		}
+		z_free.emplace(id, proven);
+		return proven;
+	}
+
+	bool complementary(int value, int inverse)
+	{
+		const auto &node = nodes[inverse];
+		if (node.op == Op::invert)
+			return node.a == value && cannot_output_z(value);
+		if (node.op != Op::literal || !node.bit.wire || nodes[value].op != Op::literal)
+			return false;
+		auto cached = literal_inverters.find(inverse);
+		if (cached == literal_inverters.end()) {
+			auto source = index.source(node.bit);
+			if (source && (source->port != ID::Y || source->cell->type != ID($not)))
+				source.reset();
+			cached = literal_inverters.emplace(inverse, source).first;
+		}
+		const auto &source = cached->second;
+		if (!source || operand(source->cell, ID::A, source->offset, source->cell->getParam(ID::A_SIGNED).as_bool()) != nodes[value].bit ||
+				!cannot_output_z(value))
+			return false;
+		producers.insert(source->cell);
+		return true;
+	}
+
 	int mux(int a, int b, int select, int stage)
 	{
 		if (a == b || constant(select, State::S0))
@@ -75,6 +123,11 @@ class PmuxSelectTree
 			return b;
 		if (constant(a, State::S0) && constant(b, State::S1))
 			return select;
+		// 高阻态可通过 mux 原样输出，按位异或会将其转成未知值。
+		if (complementary(a, b))
+			return operation(Op::bit_xor, a, select, -1, stage);
+		if (complementary(b, a))
+			return operation(Op::bit_xnor, b, select, -1, stage);
 		return operation(Op::mux, a, b, select, stage);
 	}
 
