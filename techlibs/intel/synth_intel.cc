@@ -206,9 +206,9 @@ struct SynthIntelPass : public ScriptPass {
 			run("opt_expr");
 			run("opt_clean");
 			run("check");
-			run("opt -nodffe -nosdff");
+			run("opt_pmuxprep -nodffe -nosdff");
 			run("fsm");
-			run("opt");
+			run("opt_pmuxprep");
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
@@ -236,7 +236,7 @@ struct SynthIntelPass : public ScriptPass {
 			} else {
 				run("alumacc");
 			}
-			run("opt");
+			run("opt_pmuxprep");
 			run("memory -nomap");
 			run("opt_clean");
 		}
@@ -254,11 +254,11 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_ffram")) {
-			run("opt -fast -mux_undef -undriven -fine -full");
+			run("opt_pmuxprep -fast -mux_undef -undriven -fine -full");
 			run("memory_map");
-			run("opt -undriven -fine");
+			run("opt_pmuxprep -undriven -fine");
 			run("techmap -map +/techmap.v");
-			run("opt -full");
+			run("opt_pmuxprep -full");
 			run("clean -purge");
 			run("setundef -undriven -zero");
 		}
@@ -271,7 +271,7 @@ struct SynthIntelPass : public ScriptPass {
 		if (check_label("map_luts")) {
 			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a" + string(dff ? " -dff" : ""));
 			run("clean");
-			run("opt -fast");
+			run("opt_pmuxprep -fast");
 			run("autoname");
 			run("clean");
 		}

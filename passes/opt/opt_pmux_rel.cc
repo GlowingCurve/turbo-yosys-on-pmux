@@ -1,5 +1,5 @@
-#include "kernel/yosys.h"
-#include "passes/opt/pmux_coarse.h"
+#include "passes/opt/pmux_rewrite.h"
+#include "passes/opt/pmux_select_tree.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -32,7 +32,8 @@ Parity difference(const Parity &a, const Parity &b)
 
 struct Column {
 	SigBit output;
-	std::vector<Parity> rows;
+	std::vector<Parity> rows, branches;
+	int selection = 0;
 	int term_count = 0;
 	int inversions = 0;
 	int reference = -1;
@@ -42,6 +43,7 @@ struct Column {
 struct Selection {
 	Cell *cell;
 	std::vector<Column> columns;
+	pool<Cell *> producers;
 };
 
 class RelationWorker
@@ -123,38 +125,103 @@ class RelationWorker
 		return true;
 	}
 
-	int rewrite(const SigSpec &control, const std::vector<IdString> &names, IdString type)
+	static Parity condition(Parity value, PmuxPartialCode code, const PmuxEncoding &encoding)
+	{
+		auto kept = std::remove_if(value.terms.begin(), value.terms.end(), [&](SigBit bit) {
+			auto slot = encoding.slots.find(bit);
+			if (slot == encoding.slots.end())
+				return false;
+			unsigned mask = 1u << slot->second;
+			value.inverted ^= (code.one & mask) != 0;
+			value.undef |= ((code.one | code.zero) & mask) == 0;
+			return true;
+		});
+		value.terms.erase(kept, value.terms.end());
+		return value;
+	}
+
+	bool partial_relation(const Column &base, const Column &other, const Parity &delta, const PmuxEncoding &encoding,
+			const std::vector<PmuxPartialCode> &codes, const std::vector<std::vector<PmuxBranchChoice>> &choices) const
+	{
+		if (choices.empty())
+			return false;
+		unsigned full_mask = (1u << GetSize(encoding.controls)) - 1;
+		for (int row = 0; row < GetSize(codes); ++row) {
+			auto code = codes[row];
+			if ((code.one | code.zero) == full_mask)
+				continue;
+			auto target = choices[other.selection][row];
+			if (target.first == -2)
+				continue;
+			Parity target_a = condition(other.branches[target.first + 1], code, encoding), target_b;
+			if (target.second != -2)
+				target_b = condition(other.branches[target.second + 1], code, encoding);
+			// 单个 mux 的选择位未知时，任一分支未知都会使结果未知。
+			if (target_a.undef || target_b.undef)
+				continue;
+			auto source = choices[base.selection][row];
+			if (source.first == -2)
+				return false;
+			auto matches = [&](int branch) {
+				if (branch == -2)
+					return true;
+				Parity value = condition(base.branches[branch + 1], code, encoding);
+				auto matches_target = [&](const Parity &expected) {
+					return difference(value, expected) == delta &&
+						std::includes(expected.terms.begin(), expected.terms.end(), value.terms.begin(), value.terms.end()) &&
+						std::includes(expected.terms.begin(), expected.terms.end(), delta.terms.begin(), delta.terms.end());
+				};
+				return matches_target(target_a) || (target.second != -2 && matches_target(target_b));
+			};
+			if (!matches(source.first) || !matches(source.second))
+				return false;
+		}
+		return true;
+	}
+
+	std::unique_ptr<PmuxRewrite> relations(const std::vector<Cell *> &cells, const PmuxEncoding *encoding = nullptr,
+			const std::vector<std::vector<int>> &tables = {})
 	{
 		operators.clear();
 		std::vector<Selection> selections;
+		selections.reserve(cells.size());
 		std::vector<Column *> columns;
 		pool<Cell *> candidates, replaced;
-		int rows = GetSize(control) + 1;
 		int inspected = 0;
-		for (auto name : names) {
-			auto cell = module->cell(name);
-			if (!cell || !index.editable(cell) || index.port(cell, ID::S) != control)
-				continue;
+		for (int i = 0; i < GetSize(cells); ++i) {
+			auto cell = cells[i];
+			int branches = GetSize(cell->getPort(ID::S)) + 1;
+			int rows = encoding ? GetSize(tables[i]) : branches;
 			SigSpec a = index.port(cell, ID::A), b = index.port(cell, ID::B), y = index.port(cell, ID::Y);
 			int width = GetSize(y);
-			if (width > 4096 || GetSize(a) != width || GetSize(b) != (rows - 1) * width)
+			if (width > 4096)
 				continue;
-			inspected += rows * width;
+			inspected += std::max(rows, branches) * width;
 			if (inspected > 65536)
 				break;
-			auto &selection = selections.emplace_back(Selection{cell, {}});
+			auto &selection = selections.emplace_back(Selection{cell, {}, {}});
 			for (int offset = 0; offset < width; ++offset) {
 				auto &column = selection.columns.emplace_back();
 				column.output = y[offset];
-				for (int row = 0; row < rows; ++row) {
-					auto value = expression(row == 0 ? a[offset] : b[(row - 1) * width + offset], candidates);
-					if (!value) {
-						column.rows.clear();
+				column.selection = GetSize(selections) - 1;
+				for (int branch = -1; branch < branches - 1; ++branch) {
+					auto value = expression(branch < 0 ? a[offset] : b[branch * width + offset], selection.producers);
+					if (!value)
 						break;
+					column.branches.push_back(std::move(*value));
+				}
+				if (GetSize(column.branches) != branches)
+					continue;
+				for (int row = 0; row < rows; ++row) {
+					int branch = encoding ? tables[i][row] : row - 1;
+					Parity value = column.branches[branch + 1];
+					if (encoding) {
+						unsigned mask = (1u << GetSize(encoding->controls)) - 1;
+						value = condition(std::move(value), {mask ^ unsigned(row), unsigned(row)}, *encoding);
 					}
-				column.term_count += GetSize(value->terms);
-				column.inversions += value->inverted;
-					column.rows.push_back(std::move(*value));
+					column.term_count += GetSize(value.terms);
+					column.inversions += value.inverted;
+					column.rows.push_back(std::move(value));
 				}
 			}
 			for (auto &column : selection.columns)
@@ -164,6 +231,22 @@ class RelationWorker
 			return std::tie(a->term_count, a->inversions) < std::tie(b->term_count, b->inversions);
 		});
 		dict<std::vector<Parity>, std::vector<int>> groups;
+		std::vector<PmuxPartialCode> partial_codes;
+		std::vector<std::vector<PmuxBranchChoice>> choices;
+		bool partial_prepared = false;
+		auto partial_match = [&](const Column &base, const Column &target, const Parity &delta) {
+			if (!encoding)
+				return true;
+			if (!partial_prepared) {
+				std::vector<Cell *> selected;
+				for (const auto &selection : selections)
+					selected.push_back(selection.cell);
+				partial_codes = encoding->partial_codes();
+				choices = encoding->partial_branches(selected);
+				partial_prepared = true;
+			}
+			return partial_relation(base, target, delta, *encoding, partial_codes, choices);
+		};
 		for (int col = 0; col < GetSize(columns); ++col) {
 			auto &column = *columns[col];
 			auto first = first_value(column);
@@ -175,7 +258,7 @@ class RelationWorker
 			auto &bases = groups[signature];
 			for (int base : bases) {
 				auto delta = difference(*first_value(*columns[base]), *first);
-				if (usable_relation(*columns[base], column, delta)) {
+				if (usable_relation(*columns[base], column, delta) && partial_match(*columns[base], column, delta)) {
 					column.reference = base;
 					column.delta = std::move(delta);
 					break;
@@ -185,6 +268,7 @@ class RelationWorker
 				bases.push_back(col);
 		}
 		struct MuxPlan {
+			Cell *cell;
 			SigSpec a, b, y;
 		};
 		std::vector<MuxPlan> muxes;
@@ -194,11 +278,12 @@ class RelationWorker
 				continue;
 			auto cell = selection.cell;
 			candidates.insert(cell);
+			candidates.insert(selection.producers.begin(), selection.producers.end());
 			replaced.insert(cell);
 			SigSpec a = index.port(cell, ID::A), b = index.port(cell, ID::B);
 			int width = GetSize(selection.columns);
 			std::vector<int> kept;
-			MuxPlan plan;
+			MuxPlan plan{cell, {}, {}, {}};
 			for (int offset = 0; offset < width; ++offset) {
 				const auto &column = selection.columns[offset];
 				outputs.insert(column.output);
@@ -208,19 +293,21 @@ class RelationWorker
 					plan.y.append(column.output);
 				}
 			}
-			for (int row = 0; row < rows - 1; ++row)
+			auto control = index.port(cell, ID::S);
+			for (int row = 0; row < GetSize(control); ++row)
 				for (int offset : kept)
 					plan.b.append(b[row * width + offset]);
 			if (!plan.y.empty()) {
 				inputs.insert(plan.a.begin(), plan.a.end());
 				inputs.insert(plan.b.begin(), plan.b.end());
+				inputs.insert(control.begin(), control.end());
 				muxes.push_back(std::move(plan));
 			}
 		}
 		if (replaced.empty())
-			return 0;
-		if (!muxes.empty())
-			inputs.insert(control.begin(), control.end());
+			return nullptr;
+		if (encoding)
+			candidates.insert(encoding->cells.begin(), encoding->cells.end());
 		struct ParityPlan {
 			std::vector<SigSpec> operands;
 			SigSpec y;
@@ -242,44 +329,215 @@ class RelationWorker
 				relation.operands[term + 1].append(delta.terms[term]);
 			relation.y.append(column->output);
 		}
-		int added = GetSize(muxes);
-		for (const auto &[form, relation] : relations)
-			added += std::max(form.first, int(form.second));
-		auto remove = index.removable(candidates, {}, outputs, inputs);
+		auto rewrite = std::make_unique<PmuxRewrite>(module, index, encoding ? "encoded_output_relation" : "output_relation");
+		rewrite->removed = index.removable(candidates, replaced, outputs, inputs);
 		for (auto cell : replaced)
-			if (!remove.count(cell))
-				return 0;
-		if (GetSize(remove) <= added || !index.independent(inputs, outputs))
-			return 0;
-		for (auto cell : remove)
-			module->remove(cell);
+			if (!rewrite->removed.count(cell))
+				return nullptr;
+		auto &staging = rewrite->staging;
 		for (const auto &mux : muxes) {
-			if (type == ID($mux))
-				module->addMux(NEW_ID, mux.a, mux.b, control, mux.y);
+			auto control = index.port(mux.cell, ID::S);
+			if (mux.cell->type == ID($mux))
+				staging.addMux(NEW_ID, mux.a, mux.b, control, mux.y, mux.cell->get_src_attribute());
 			else
-				module->addPmux(NEW_ID, mux.a, mux.b, control, mux.y);
+				staging.addPmux(NEW_ID, mux.a, mux.b, control, mux.y, mux.cell->get_src_attribute());
 		}
 		for (const auto &[form, relation] : relations) {
 			const auto &[terms, inverted] = form;
 			SigSpec left = relation.operands[0];
 			if (!terms) {
 				if (inverted)
-					module->addNot(NEW_ID, left, relation.y);
+					staging.addNot(NEW_ID, left, relation.y);
 				else
-					module->connect(relation.y, left);
+					rewrite->connect(relation.y, left);
 			}
 			for (int term = 1; term <= terms; ++term) {
 				bool final = term == terms;
 				SigSpec right = relation.operands[term];
-				SigSpec output = final ? relation.y : SigSpec(module->addWire(NEW_ID, GetSize(relation.y)));
+				SigSpec output = final ? relation.y : SigSpec(staging.addWire(NEW_ID, GetSize(relation.y)));
 				if (final && inverted)
-					module->addXnor(NEW_ID, left, right, output);
+					staging.addXnor(NEW_ID, left, right, output);
 				else
-					module->addXor(NEW_ID, left, right, output);
+					staging.addXor(NEW_ID, left, right, output);
 				left = output;
 			}
 		}
-		return GetSize(remove) - added;
+		if (!rewrite->validate())
+			return nullptr;
+		return rewrite;
+	}
+
+	struct SwapColumn {
+		int cell, offset;
+		std::vector<int> values;
+	};
+
+	std::unique_ptr<PmuxRewrite> swap_outputs(const std::vector<Cell *> &cells, const PmuxEncoding &encoding,
+			PmuxSelectTree &tree, const std::vector<SwapColumn> &columns, int flip)
+	{
+		dict<std::vector<int>, std::vector<int>> groups;
+		for (int col = 0; col < GetSize(columns); ++col)
+			groups[columns[col].values].push_back(col);
+		pool<int> used;
+		pool<Cell *> replaced;
+		std::vector<int> controls, roots;
+		std::vector<pool<int>> offsets(cells.size());
+		pool<SigBit> inputs, outputs;
+		SigSpec swap_y;
+		bool shares_selection = false;
+		for (int control = 0; control < GetSize(encoding.controls); ++control)
+			if (control != flip)
+				controls.push_back(control);
+		for (int col = 0; col < GetSize(columns); ++col) {
+			if (used.count(col))
+				continue;
+			const auto &a = columns[col];
+			int mask = 1 << flip;
+			std::vector<int> reversed;
+			for (int row = 0; row < GetSize(a.values); ++row)
+				reversed.push_back(a.values[row ^ mask]);
+			if (reversed == a.values)
+				continue;
+			auto partners = groups.find(reversed);
+			if (partners == groups.end())
+				continue;
+			auto partner = std::find_if(partners->second.begin(), partners->second.end(), [&](int id) { return !used.count(id); });
+			if (partner == partners->second.end())
+				continue;
+			const auto &b = columns[*partner];
+			used.insert(col);
+			used.insert(*partner);
+			std::vector<int> low_a, low_b;
+			for (int row = 0; row < GetSize(a.values); ++row) {
+				if (row & mask)
+					continue;
+				low_a.push_back(a.values[row]);
+				low_b.push_back(b.values[row]);
+			}
+			shares_selection |= std::adjacent_find(low_a.begin(), low_a.end(), std::not_equal_to<int>{}) != low_a.end() ||
+					std::adjacent_find(low_b.begin(), low_b.end(), std::not_equal_to<int>{}) != low_b.end();
+			int left = tree.column(std::move(low_a), controls);
+			int right = tree.column(std::move(low_b), controls);
+			int level = GetSize(controls);
+			roots.push_back(tree.select(flip, level, left, right));
+			roots.push_back(tree.select(flip, level, right, left));
+			for (auto column : {a, b}) {
+				auto cell = cells[column.cell];
+				swap_y.append(index.port(cell, ID::Y)[column.offset]);
+				replaced.insert(cell);
+				offsets[column.cell].insert(column.offset);
+			}
+		}
+		if (roots.empty())
+			return nullptr;
+		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "encoded_output_swap");
+		inputs = tree.inputs(roots);
+		auto &staging = rewrite->staging;
+		rewrite->connect(swap_y, tree.emit(&staging, roots, cells.front()->get_src_attribute()));
+		bool combines_selections = GetSize(replaced) > 1;
+		for (int pos = 0; pos < GetSize(cells); ++pos) {
+			if (offsets[pos].empty())
+				continue;
+			auto cell = cells[pos];
+			auto a = index.port(cell, ID::A), b = index.port(cell, ID::B), y = index.port(cell, ID::Y), select = index.port(cell, ID::S);
+			outputs.insert(y.begin(), y.end());
+			SigSpec keep_a, keep_b, keep_y;
+			for (int offset = 0; offset < GetSize(y); ++offset)
+				if (!offsets[pos].count(offset)) {
+					keep_a.append(a[offset]);
+					keep_y.append(y[offset]);
+				}
+			if (keep_y.empty())
+				continue;
+			combines_selections = false;
+			for (int branch = 0; branch < GetSize(select); ++branch)
+				for (int offset = 0; offset < GetSize(y); ++offset)
+					if (!offsets[pos].count(offset))
+						keep_b.append(b[branch * GetSize(y) + offset]);
+			inputs.insert(keep_a.begin(), keep_a.end());
+			inputs.insert(keep_b.begin(), keep_b.end());
+			inputs.insert(select.begin(), select.end());
+			if (cell->type == ID($mux))
+				staging.addMux(NEW_ID, keep_a, keep_b, select, keep_y, cell->get_src_attribute());
+			else
+				staging.addPmux(NEW_ID, keep_a, keep_b, select, keep_y, cell->get_src_attribute());
+		}
+		pool<Cell *> candidates = encoding.cells;
+		candidates.insert(replaced.begin(), replaced.end());
+		candidates.insert(tree.producers.begin(), tree.producers.end());
+		rewrite->removed = index.removable(candidates, replaced, outputs, inputs);
+		bool removes_selection_logic = std::any_of(rewrite->removed.begin(), rewrite->removed.end(), [&](auto cell) {
+			return !replaced.count(cell) || cell->type == ID($pmux);
+		});
+		if ((!shares_selection && !combines_selections && !removes_selection_logic) ||
+				!std::all_of(replaced.begin(), replaced.end(), [&](auto cell) { return rewrite->removed.count(cell); }) || !rewrite->validate())
+			return nullptr;
+		return rewrite;
+	}
+
+	bool apply(std::unique_ptr<PmuxRewrite> rewrite)
+	{
+		if (!rewrite)
+			return false;
+		rewrite->commit();
+		return true;
+	}
+
+	std::vector<Cell *> live_cells(const std::vector<IdString> &names)
+	{
+		std::vector<Cell *> result;
+		for (auto name : names)
+			if (auto cell = module->cell(name); cell && index.editable(cell))
+				result.push_back(cell);
+		return result;
+	}
+
+	std::vector<Cell *> selected_choices()
+	{
+		auto cells = module->selected_cells();
+		cells.erase(std::remove_if(cells.begin(), cells.end(), [&](auto cell) {
+			return !pmux_select_shape(cell) || !index.editable(cell);
+		}), cells.end());
+		std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
+		return cells;
+	}
+
+	bool rewrite_encoded(const std::vector<IdString> &names)
+	{
+		auto cells = live_cells(names);
+		if (cells.empty())
+			return false;
+		std::vector<SigSpec> selects;
+		for (auto cell : cells)
+			selects.push_back(index.port(cell, ID::S));
+		PmuxEncoding encoding(index);
+		std::vector<std::vector<int>> tables;
+		if (!encoding.branch_tables(selects, tables))
+			return false;
+		if (apply(relations(cells, &encoding, tables)))
+			return true;
+		PmuxSelectTree tree(index, encoding);
+		std::vector<SwapColumn> columns;
+		int rows = GetSize(tables.front());
+		for (int i = 0; i < GetSize(cells); ++i) {
+			auto a = index.port(cells[i], ID::A), b = index.port(cells[i], ID::B);
+			int width = GetSize(a);
+			if (GetSize(columns) + width > pmux_max_table_bits / rows)
+				break;
+			for (int offset = 0; offset < width; ++offset) {
+				auto &column = columns.emplace_back(SwapColumn{i, offset, {}});
+				for (int row = 0; row < rows; ++row) {
+					int branch = tables[i][row];
+					SigBit bit = branch < 0 ? a[offset] : b[branch * width + offset];
+					column.values.push_back(tree.fold(bit, row));
+				}
+			}
+		}
+		if (GetSize(columns) >= 2)
+			for (int flip = 0; flip < GetSize(encoding.controls); ++flip)
+				if (apply(swap_outputs(cells, encoding, tree, columns, flip)))
+					return true;
+		return false;
 	}
 
 public:
@@ -287,20 +545,31 @@ public:
 
 	void run()
 	{
-		dict<std::pair<IdString, SigSpec>, std::vector<IdString>> groups;
-		for (auto cell : module->selected_cells()) {
-			if (!cell->type.in(ID($mux), ID($pmux)))
-				continue;
+		dict<std::pair<IdString, SigSpec>, std::vector<IdString>> exact;
+		for (auto cell : selected_choices()) {
 			SigSpec select = index.port(cell, ID::S);
-			if (select.empty() || GetSize(select) > 32)
-				continue;
-			groups[{cell->type, select}].push_back(cell->name);
+			if (GetSize(select) <= 32)
+				exact[{cell->type, select}].push_back(cell->name);
 		}
-		int saved = 0;
-		for (const auto &[key, cells] : groups)
-			saved += rewrite(index.sigmap(key.second), cells, key.first);
-		if (saved)
-			log("  %s: shared selection output relations, removed %d net cells.\n", log_id(module), saved);
+		bool changed = false;
+		int before = module->cells_size();
+		for (const auto &[key, names] : exact) {
+			auto matching = live_cells(names);
+			auto control = index.sigmap(key.second);
+			matching.erase(std::remove_if(matching.begin(), matching.end(), [&](auto cell) { return index.port(cell, ID::S) != control; }), matching.end());
+			changed |= apply(relations(matching));
+		}
+		dict<SigSpec, std::vector<IdString>> encoded;
+		for (auto cell : selected_choices()) {
+			PmuxEncoding encoding(index);
+			std::vector<int> rows;
+			if (encoding.branch_table(index.port(cell, ID::S), rows))
+				encoded[pmux_control_key(encoding)].push_back(cell->name);
+		}
+		for (const auto &[key, names] : encoded)
+			changed |= rewrite_encoded(names);
+		if (changed)
+			log("  %s: shared selection output relations, RTLIL cell delta %+d.\n", log_id(module), module->cells_size() - before);
 	}
 };
 
@@ -310,8 +579,7 @@ struct OptPmuxRelPass : Pass {
 	void help() override
 	{
 		log("    opt_pmux_rel [selection]\n\n");
-		log("Share corresponding output columns of muxes with equal selectors when their\n");
-		log("data is identical or differs by a branch-independent XOR and RTLIL cell count decreases.\n");
+		log("Share selection outputs related by a fixed XOR or a swap under one control bit.\n");
 	}
 
 	void execute(std::vector<std::string> args, Design *design) override

@@ -93,6 +93,18 @@ yosys_pass(opt_pmux_rel
 yosys_pass(opt_pmux_select
 	opt_pmux_select.cc
 )
+yosys_pass(opt_pmuxprep
+	opt_pmuxprep.cc
+	REQUIRES
+		opt_clean
+		opt_dff
+		opt_expr
+		opt_hier
+		opt_merge
+		opt_muxtree
+		opt_reduce
+		opt_share
+)
 
 pmgen_command(peepopt
 	peepopt_shiftmul_right.pmg
@@ -110,7 +122,7 @@ yosys_pass(peepopt
 	${PMGEN_peepopt_OUTPUT}
 )
 
-# Link the coarse PMUX passes through synth_intel's peepopt dependency in a selective build.
+# Link the PMUX passes through synth_intel's peepopt dependency in a selective build.
 if (synth_intel IN_LIST YOSYS_COMPONENTS)
 	set_property(TARGET yosys_peepopt APPEND PROPERTY YOSYS_REQUIRES
 		opt_pmux_context
@@ -119,5 +131,6 @@ if (synth_intel IN_LIST YOSYS_COMPONENTS)
 		opt_pmux_state
 		opt_pmux_rel
 		opt_pmux_select
+		opt_pmuxprep
 	)
 endif()

@@ -1,7 +1,7 @@
 #include "kernel/celltypes.h"
 #include "kernel/log.h"
 #include "kernel/register.h"
-#include "passes/opt/pmux_coarse.h"
+#include "passes/opt/pmux_rewrite.h"
 
 #include <algorithm>
 #include <optional>
@@ -44,11 +44,19 @@ struct ContextRewrite
 	struct Node {
 		Cell *original;
 		Value a, b, s;
+		int width;
+		bool narrowed;
+	};
+	struct BitClass {
+		SigBit parent;
+		int rank = 0;
 	};
 
 	PmuxCoarseIndex &index;
 	Cell *consumer;
-	dict<SigBit, State> facts;
+	dict<SigBit, BitClass> equalities;
+	pool<std::pair<SigBit, SigBit>> direct_equalities;
+	pool<SigBit> checked_assumptions;
 	dict<Cell *, Value> cached;
 	pool<Cell *> active, candidates;
 	std::vector<Node> nodes;
@@ -75,10 +83,72 @@ struct ContextRewrite
 		return true;
 	}
 
-	SigBit assumed(SigBit bit) const
+	SigBit representative(SigBit bit)
 	{
-		auto fact = facts.find(bit);
-		return fact == facts.end() ? bit : SigBit(fact->second);
+		auto entry = equalities.find(bit);
+		if (entry == equalities.end() || entry->second.parent == bit)
+			return bit;
+		return entry->second.parent = representative(entry->second.parent);
+	}
+
+	SigBit assumed(SigBit bit)
+	{
+		auto root = representative(bit);
+		return binary(root) ? root : bit;
+	}
+
+	bool equate(SigBit left, SigBit right)
+	{
+		left = representative(left);
+		right = representative(right);
+		if (!left.wire && !right.wire)
+			return binary(left) && left == right;
+		if (left == right)
+			return true;
+		if (!left.wire)
+			std::swap(left, right);
+		if (!right.wire) {
+			if (!binary(right))
+				return false;
+			equalities[left] = {right};
+			return true;
+		}
+		equalities.insert({left, {left}});
+		equalities.insert({right, {right}});
+		if (equalities.at(left).rank < equalities.at(right).rank)
+			std::swap(left, right);
+		auto &parent = equalities.at(left);
+		auto &child = equalities.at(right);
+		if (parent.rank == child.rank)
+			parent.rank++;
+		child.parent = left;
+		return true;
+	}
+
+	static std::pair<SigBit, SigBit> ordered_pair(SigBit left, SigBit right)
+	{
+		if (right < left)
+			std::swap(left, right);
+		return {left, right};
+	}
+
+	bool assume_equal(SigBit left, SigBit right, int depth)
+	{
+		if (consumer->type == ID($mux)) {
+			// 选择信号未定义时，$mux 仍可保留两个分支中相同的已定义位。
+			// 中间位未定义时，两个直接相等条件无法约束两端的已定义值相等。
+			if (left.wire && right.wire) {
+				direct_equalities.insert(ordered_pair(left, right));
+				return true;
+			}
+			if (binary(left))
+				return assume(right, left.data, depth);
+			return binary(right) && assume(left, right.data, depth);
+		}
+		if (!equate(left, right))
+			return false;
+		auto value = assumed(left);
+		return !binary(value) || (assume(left, value.data, depth) && assume(right, value.data, depth));
 	}
 
 	bool assume(SigBit bit, State value, int depth = 0)
@@ -86,11 +156,10 @@ struct ContextRewrite
 		if (budget <= 0 || depth > max_depth)
 			return true;
 		budget--;
-		if (!bit.wire)
-			return bit == value;
-		auto binding = facts.insert(std::make_pair(bit, value));
-		if (!binding.second)
-			return binding.first->second == value;
+		if (!equate(bit, value))
+			return false;
+		if (!bit.wire || !checked_assumptions.insert(bit).second)
+			return true;
 
 		auto source = index.source(bit);
 		if (!source || !source->cell || source->port != ID::Y || source->cell == consumer)
@@ -116,10 +185,7 @@ struct ContextRewrite
 			const auto &[a, b] = *comparison;
 			for (int i = 0; i < GetSize(a) && budget > 0; i++) {
 				budget--;
-				auto left = assumed(a[i]), right = assumed(b[i]);
-				if (binary(left) && !assume(right, left.data, depth + 1))
-					return false;
-				if (binary(right) && !assume(left, right.data, depth + 1))
+				if (!assume_equal(a[i], b[i], depth + 1))
 					return false;
 			}
 			return true;
@@ -160,6 +226,103 @@ struct ContextRewrite
 	{
 		Bit fill = sign && !value.empty() ? value.back() : Bit{State::S0};
 		value.resize(width, fill);
+	}
+
+	bool equal(const Bit &left, const Bit &right)
+	{
+		if (left.node >= 0 || right.node >= 0)
+			return left == right;
+		if ((!left.signal.wire && !binary(left.signal)) || (!right.signal.wire && !binary(right.signal)))
+			return false;
+		return representative(left.signal) == representative(right.signal) ||
+			direct_equalities.count(ordered_pair(left.signal, right.signal));
+	}
+
+	Value make_node(Cell *cell, Value a, Value b, Value s, int width, bool narrowed = false)
+	{
+		int node = GetSize(nodes);
+		nodes.push_back({cell, std::move(a), std::move(b), std::move(s), width, narrowed});
+		Value result;
+		result.reserve(width);
+		for (int i = 0; i < width; i++)
+			result.push_back({{}, node, i});
+		return result;
+	}
+
+	std::optional<Value> simplify_equal(Cell *cell, Value a, Value b, int width)
+	{
+		bool sign = signed_port(cell, ID::A_SIGNED) && signed_port(cell, ID::B_SIGNED);
+		int operands_width = cell->type.in(ID($eq), ID($ne)) ? std::max(GetSize(a), GetSize(b)) : width;
+		extend(a, operands_width, sign);
+		extend(b, operands_width, sign);
+
+		if (cell->type.in(ID($eq), ID($ne))) {
+			Value variable_a, variable_b;
+			bool mismatch = false;
+			for (int i = 0; i < operands_width; i++) {
+				if (equal(a[i], b[i]))
+					continue;
+				if ((a[i].is(State::S0) && b[i].is(State::S1)) || (a[i].is(State::S1) && b[i].is(State::S0))) {
+					mismatch = true;
+					break;
+				}
+				variable_a.push_back(a[i]);
+				variable_b.push_back(b[i]);
+			}
+			if (!mismatch) {
+				if (GetSize(variable_a) == operands_width)
+					return std::nullopt;
+				if (!variable_a.empty())
+					return make_node(cell, std::move(variable_a), std::move(variable_b), {}, width, true);
+			}
+			Value result(width, Bit{State::S0});
+			result[0] = {(cell->type == ID($eq)) != mismatch ? State::S1 : State::S0};
+			return result;
+		}
+
+		if (cell->type == ID($sub)) {
+			int prefix = 0;
+			while (prefix < width && equal(a[prefix], b[prefix]))
+				prefix++;
+			if (prefix == 0)
+				return std::nullopt;
+			Value result(prefix, Bit{State::S0});
+			if (prefix < width) {
+				// 相同低位相减无需向高位借位。
+				Value high_a(a.begin() + prefix, a.end()), high_b(b.begin() + prefix, b.end());
+				auto high = make_node(cell, std::move(high_a), std::move(high_b), {}, width - prefix, true);
+				result.insert(result.end(), high.begin(), high.end());
+			}
+			return result;
+		}
+
+		log_assert(cell->type == ID($xor));
+		Value result(width, Bit{State::S0}), variable_a, variable_b;
+		std::vector<int> variable_offsets;
+		bool simplified = false;
+		for (int i = 0; i < width; i++) {
+			if (equal(a[i], b[i])) {
+				simplified = true;
+			} else if (a[i].is(State::S0)) {
+				result[i] = b[i];
+				simplified = true;
+			} else if (b[i].is(State::S0)) {
+				result[i] = a[i];
+				simplified = true;
+			} else {
+				variable_a.push_back(a[i]);
+				variable_b.push_back(b[i]);
+				variable_offsets.push_back(i);
+			}
+		}
+		if (!simplified)
+			return std::nullopt;
+		if (!variable_offsets.empty()) {
+			auto variable = make_node(cell, std::move(variable_a), std::move(variable_b), {}, GetSize(variable_offsets), true);
+			for (int i = 0; i < GetSize(variable_offsets); i++)
+				result[variable_offsets[i]] = variable[i];
+		}
+		return result;
 	}
 
 	static std::optional<Value> simplify(Cell *cell, const Value &a, const Value &b, const Value &s, int width)
@@ -247,7 +410,7 @@ struct ContextRewrite
 			}
 			auto cell = source->cell;
 			auto found = cached.find(cell);
-		if (found == cached.end() && can_specialize(cell) && GetSize(cell->getPort(ID::Y)) <= budget &&
+			if (found == cached.end() && can_specialize(cell) && GetSize(cell->getPort(ID::Y)) <= budget &&
 				index.editable(cell) && active.insert(cell).second) {
 				candidates.insert(cell);
 				auto value = specialize(cell, depth + 1);
@@ -269,22 +432,23 @@ struct ContextRewrite
 		auto original_s = is_selection(cell) ? index.port(cell, ID::S) : SigSpec();
 		auto output = index.port(cell, ID::Y);
 		auto a = specialize(original_a, depth), b = specialize(original_b, depth), s = specialize(original_s, depth);
-		if (is_original(a, original_a) && is_original(b, original_b) && is_original(s, original_s))
+		bool unchanged = is_original(a, original_a) && is_original(b, original_b) && is_original(s, original_s);
+		if (!unchanged)
+			if (auto simplified = simplify(cell, a, b, s, GetSize(output)))
+				return std::move(*simplified);
+		if (cell->type.in(ID($xor), ID($sub), ID($eq), ID($ne)))
+			if (auto simplified = simplify_equal(cell, a, b, GetSize(output)))
+				return std::move(*simplified);
+		if (unchanged)
 			return literal(output);
-		auto simplified = simplify(cell, a, b, s, GetSize(output));
-		if (simplified)
-			return std::move(*simplified);
-		int node = GetSize(nodes);
-		nodes.push_back({cell, std::move(a), std::move(b), std::move(s)});
-		Value result;
-		for (int i = 0; i < GetSize(output); i++)
-			result.push_back({{}, node, i});
-		return result;
+		return make_node(cell, std::move(a), std::move(b), std::move(s), GetSize(output));
 	}
 
 	Value branch(const SigSpec &data, const SigSpec &select, int selected)
 	{
-		facts.clear();
+		equalities.clear();
+		direct_equalities.clear();
+		checked_assumptions.clear();
 		cached.clear();
 		if (selected < 0) {
 			for (auto bit : select)
@@ -292,7 +456,7 @@ struct ContextRewrite
 					return literal(data);
 		} else if (!assume(select[selected], State::S1))
 			return literal(data);
-		return facts.empty() ? literal(data) : specialize(data);
+		return equalities.empty() ? literal(data) : specialize(data);
 	}
 
 	void find_inputs(const Value &value, pool<SigBit> &inputs, pool<int> &needed)
@@ -339,24 +503,34 @@ struct ContextRewrite
 		for (auto bit : select)
 			if (bit.wire)
 				retained.insert(bit);
-		auto removed = index.removable(candidates, {consumer}, {}, retained);
-		if (GetSize(removed) <= GetSize(needed))
-			return false;
 		pool<SigBit> outputs;
 		for (auto bit : index.port(consumer, ID::Y))
 			outputs.insert(bit);
-		if (!index.independent(retained, outputs))
+		candidates.insert(consumer);
+		auto removed = index.removable(candidates, {}, outputs, retained);
+		if (!removed.count(consumer) || std::any_of(needed.begin(), needed.end(), [&](int i) {
+			return !removed.count(nodes[i].original);
+		}))
 			return false;
 
+		PmuxRewrite rewrite(index.module, index, "context");
+		rewrite.removed = std::move(removed);
 		std::vector<Wire *> wires(nodes.size(), nullptr);
 		for (int i = 0; i < GetSize(nodes); i++) {
 			if (!needed.count(i))
 				continue;
 			const auto &node = nodes[i];
-			wires[i] = index.module->addWire(NEW_ID, GetSize(node.original->getPort(ID::Y)));
-			auto replacement = index.module->addCell(NEW_ID, node.original->type);
+			wires[i] = rewrite.staging.addWire(NEW_ID, node.width);
+			auto replacement = rewrite.staging.addCell(NEW_ID, node.original->type);
 			replacement->attributes = node.original->attributes;
 			replacement->parameters = node.original->parameters;
+			if (node.narrowed) {
+				replacement->setParam(ID::A_SIGNED, false);
+				replacement->setParam(ID::B_SIGNED, false);
+				replacement->setParam(ID::A_WIDTH, GetSize(node.a));
+				replacement->setParam(ID::B_WIDTH, GetSize(node.b));
+				replacement->setParam(ID::Y_WIDTH, node.width);
+			}
 			replacement->setPort(ID::Y, wires[i]);
 			replacement->setPort(ID::A, materialize(node.a, wires));
 			if (node.original->hasPort(ID::B))
@@ -364,11 +538,12 @@ struct ContextRewrite
 			if (is_selection(replacement))
 				replacement->setPort(ID::S, materialize(node.s, wires));
 		}
-		consumer->setPort(ID::A, materialize(a, wires));
-		consumer->setPort(ID::B, materialize(b, wires));
-		for (auto cell : removed)
-			index.module->remove(cell);
-		log_debug("Specialized %s using %d fewer cells.\n", log_id(consumer), GetSize(removed) - GetSize(needed));
+		auto selection = rewrite.staging.addCell(consumer->name, consumer);
+		selection->setPort(ID::A, materialize(a, wires));
+		selection->setPort(ID::B, materialize(b, wires));
+		if (!rewrite.validate())
+			return false;
+		rewrite.commit();
 		return true;
 	}
 };
@@ -382,7 +557,8 @@ struct OptPmuxContextPass : public Pass
 		log("    opt_pmux_context [selection]\n");
 		log("\n");
 		log("Propagate branch conditions into the data of $mux and $pmux cells.\n");
-		log("Apply a rewrite when it reduces the number of RTLIL cells.\n");
+		log("Use constant bits and operand equalities implied by the conditions.\n");
+		log("Rebuild an operation only when its original cell can be removed.\n");
 		log("Rewrites can refine undefined values. Designs with case equality or tri-state drivers are skipped.\n");
 		log("\n");
 	}
@@ -403,7 +579,6 @@ struct OptPmuxContextPass : public Pass
 			if (selections.empty())
 				continue;
 			PmuxCoarseIndex index(module);
-			int before = module->cells_size();
 			int changes = 0;
 			for (auto name : selections) {
 				auto cell = module->cell(name);
@@ -411,7 +586,7 @@ struct OptPmuxContextPass : public Pass
 					changes += ContextRewrite(index, cell).run();
 			}
 			if (changes)
-				log("Specialized %d selections in %s, removing %d RTLIL cells net.\n", changes, log_id(module), before - module->cells_size());
+				log("Specialized %d selections in %s.\n", changes, log_id(module));
 		}
 	}
 } OptPmuxContextPass;

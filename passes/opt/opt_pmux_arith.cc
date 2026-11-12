@@ -1,6 +1,6 @@
 #include "kernel/log.h"
 #include "kernel/register.h"
-#include "pmux_coarse.h"
+#include "pmux_rewrite.h"
 
 #include <algorithm>
 #include <map>
@@ -13,14 +13,17 @@ struct ArithmeticExpression
 {
 	std::map<SigSpec, int> terms;
 	Const offset;
+	bool has_offset = false;
+	bool simplified = false;
 
 	explicit ArithmeticExpression(int width) : offset(0, width) {}
 };
 
 struct ArithmeticColumn
 {
-	std::vector<SigSpec> values;
-	bool selected;
+	SigSpec operand;
+	std::vector<SigSpec> variants;
+	std::vector<std::pair<int, int>> varying_bits;
 	bool subtract;
 };
 
@@ -106,6 +109,8 @@ struct ArithmeticRewrite
 		if (value.is_fully_const()) {
 			if (!value.is_fully_def())
 				return false;
+			expression.simplified |= expression.has_offset || value.is_fully_zero();
+			expression.has_offset = true;
 			expression.offset = sign > 0 ? const_add(expression.offset, value.as_const(), false, false, width)
 				: const_sub(expression.offset, value.as_const(), false, false, width);
 			return true;
@@ -150,6 +155,7 @@ struct ArithmeticRewrite
 				return false;
 		value = trim_zero_extension(value);
 		int &coefficient = expression.terms[value];
+		expression.simplified |= coefficient != 0 && (coefficient > 0) != (sign > 0);
 		coefficient += sign;
 		if (coefficient == 0)
 			expression.terms.erase(value);
@@ -159,30 +165,43 @@ struct ArithmeticRewrite
 
 void add_column(ArithmeticPlan &plan, const std::vector<SigSpec> &values, const std::vector<bool> &defined, bool subtract)
 {
-	SigSpec common;
 	int width = 0;
-	bool same = true;
-	for (int i = 0; i < GetSize(values); i++) {
-		if (!defined[i])
-			continue;
-		width = std::max(width, GetSize(values[i]));
-		if (common.empty())
-			common = values[i];
-		same &= values[i] == common;
-	}
-	if (same) {
-		if (!common.is_fully_zero())
-			plan.push_back({{common}, false, subtract});
-		return;
+	for (int i = 0; i < GetSize(values); i++)
+		if (defined[i])
+			width = std::max(width, GetSize(values[i]));
+
+	std::vector<SigSpec> padded;
+	for (auto value : values) {
+		value.extend_u0(width);
+		padded.push_back(std::move(value));
 	}
 
-	ArithmeticColumn column{{}, true, subtract};
-	for (int i = 0; i < GetSize(values); i++) {
-		SigSpec value = defined[i] ? values[i] : SigSpec(State::Sx, width);
-		value.extend_u0(width);
-		column.values.push_back(value);
+	int first = std::find(defined.begin(), defined.end(), true) - defined.begin();
+	ArithmeticColumn column{padded[first], {}, {}, subtract};
+	dict<SigSpec, int> lanes;
+	for (int bit = 0; bit < width; bit++) {
+		SigSpec lane;
+		bool common = true;
+		for (int branch = 0; branch < GetSize(values); branch++) {
+			const SigSpec &value = padded[branch];
+			common &= !defined[branch] || value[bit] == column.operand[bit];
+			lane.append(defined[branch] ? value[bit] : SigBit(State::Sx));
+		}
+		if (common)
+			continue;
+
+		auto [slot, inserted] = lanes.emplace(lane, GetSize(lanes));
+		column.varying_bits.emplace_back(bit, slot->second);
+		column.operand[bit] = State::S0;
+		if (inserted) {
+			column.variants.resize(GetSize(values));
+			for (int branch = 0; branch < GetSize(values); branch++)
+				column.variants[branch].append(lane[branch]);
+		}
 	}
-	plan.push_back(std::move(column));
+
+	if (!column.variants.empty() || !column.operand.is_fully_zero())
+		plan.push_back(std::move(column));
 }
 
 ArithmeticPlan make_column_plan(std::vector<ArithmeticExpression> expressions, const std::vector<bool> &defined)
@@ -200,7 +219,7 @@ ArithmeticPlan make_column_plan(std::vector<ArithmeticExpression> expressions, c
 				common = entry == expressions[i].terms.end() ? 0 : std::min(common, entry->second * sign);
 			}
 			for (int n = 0; n < common; n++)
-				plan.push_back({{term}, false, sign < 0});
+				plan.push_back({term, {}, {}, sign < 0});
 			if (common > 0)
 				for (int i = 0; i < GetSize(expressions); i++)
 					if (defined[i])
@@ -268,45 +287,33 @@ ArithmeticPlan make_exclusion_plan(const std::vector<ArithmeticExpression> &expr
 
 	ArithmeticPlan plan;
 	for (const auto &term : total)
-		plan.push_back({{term}, false, false});
+		plan.push_back({term, {}, {}, false});
 	add_column(plan, excluded, defined, true);
 	add_column(plan, offsets, defined, false);
 	return plan;
 }
 
-struct ArithmeticCost
+bool prepare_arithmetic_rewrite(PmuxRewrite &candidate, PmuxCoarseIndex &index, Cell *root,
+		const pool<Cell *> &region, const SigSpec &result)
 {
-	pool<Cell *> remove;
-	int added = 0;
-	int selected_bits = 0;
-	int gain() const { return GetSize(remove) - added; }
-};
-
-ArithmeticCost cost_plan(PmuxCoarseIndex &index, const pool<Cell *> &region, const SigSpec &output,
-		const SigSpec &select, const ArithmeticPlan &plan)
-{
-	ArithmeticCost cost;
-	pool<SigBit> inputs;
-	pool<SigBit> outputs;
-	bool has_positive_term = false;
-	for (const auto &column : plan) {
-		has_positive_term |= !column.subtract;
-		if (column.selected) {
-			cost.added++;
-			cost.selected_bits += GetSize(column.values.front());
-			for (auto bit : select)
+	pool<SigBit> inputs, outputs;
+	auto record_inputs = [&](const SigSpec &signal) {
+		for (auto bit : signal)
+			if (bit.wire && bit.wire->module == index.module)
 				inputs.insert(bit);
-		}
-		for (const auto &value : column.values)
-			for (auto bit : value)
-				inputs.insert(bit);
-	}
-	cost.added += GetSize(plan) - int(has_positive_term);
-	for (auto bit : output)
+	};
+	for (auto cell : candidate.staging.cells())
+		for (const auto &[port, signal] : cell->connections())
+			if (cell->input(port))
+				record_inputs(signal);
+	record_inputs(result);
+	for (auto bit : index.port(root, ID::Y))
 		outputs.insert(bit);
-	if (index.independent(inputs, outputs))
-		cost.remove = index.removable(region, {}, outputs, inputs);
-	return cost;
+	candidate.removed = index.removable(region, {}, outputs, inputs);
+	if (!candidate.removed.count(root))
+		return false;
+	candidate.connect(root->getPort(ID::Y), result);
+	return true;
 }
 
 SigSpec emit_arithmetic(Module *module, const ArithmeticPlan &plan, const SigSpec &select, int width)
@@ -317,15 +324,16 @@ SigSpec emit_arithmetic(Module *module, const ArithmeticPlan &plan, const SigSpe
 		for (const auto &column : plan) {
 			if (column.subtract != subtract)
 				continue;
-			SigSpec operand = column.values.front();
-			if (column.selected) {
+			SigSpec operand = column.operand;
+			if (!column.variants.empty()) {
 				SigSpec cases;
-				for (int i = 1; i < GetSize(column.values); i++)
-					cases.append(column.values[i]);
-				if (GetSize(select) == 1)
-					operand = module->Mux(NEW_ID, operand, cases, select);
-				else
-					operand = module->Pmux(NEW_ID, operand, cases, select);
+				for (int i = 1; i < GetSize(column.variants); i++)
+					cases.append(column.variants[i]);
+				SigSpec selected = GetSize(select) == 1
+					? module->Mux(NEW_ID, column.variants.front(), cases, select)
+					: module->Pmux(NEW_ID, column.variants.front(), cases, select);
+				for (auto [bit, slot] : column.varying_bits)
+					operand[bit] = selected[slot];
 			}
 			if (has_result || subtract) {
 				SigSpec sum(module->addWire(NEW_ID, width));
@@ -359,10 +367,11 @@ bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs
 	} else {
 		select = index.port(root, ID::S);
 		SigSpec data = index.port(root, ID::B);
-		if (select.empty() || GetSize(select) > 64 || GetSize(data) != width * GetSize(select))
+		int count = GetSize(select);
+		if (count == 0 || count > 64 || GetSize(data) / count != width || GetSize(data) % count != 0)
 			return false;
 		branches.push_back(index.port(root, ID::A));
-		for (int i = 0; i < GetSize(select); i++)
+		for (int i = 0; i < count; i++)
 			branches.push_back(data.extract(i * width, width));
 		if (std::none_of(branches.begin(), branches.end(), [&](const SigSpec &branch) {
 			Cell *driver = branch.empty() ? nullptr : index.driver(branch[0]);
@@ -395,32 +404,207 @@ bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs
 	}
 	if (rewrite.region.empty())
 		return false;
+	if (select.empty() && !expressions.front().simplified && !expressions.front().terms.empty())
+		return false;
 	rewrite.region.insert(root);
 
-	ArithmeticPlan plan = make_column_plan(expressions, defined);
-	ArithmeticCost cost = cost_plan(index, rewrite.region, output, select, plan);
+	auto apply = [&](const ArithmeticPlan &plan, const char *rule) {
+		PmuxRewrite candidate(index.module, index, rule);
+		auto result = emit_arithmetic(&candidate.staging, plan, select, width);
+		if (!prepare_arithmetic_rewrite(candidate, index, root, rewrite.region, result))
+			return false;
+		// 保留外部仍在使用的生产者，并确认本次重建能消除旧算术。
+		if (candidate.added_count() && std::none_of(candidate.removed.begin(), candidate.removed.end(), [&](Cell *cell) {
+				return cell != root && arithmetic_type(cell->type);
+			}))
+			return false;
+		if (!candidate.validate())
+			return false;
+		log("  Rewriting arithmetic at %s.%s (%d cells removed, %d added).\n",
+			log_id(index.module), log_id(root), GetSize(candidate.removed), candidate.added_count());
+		candidate.commit();
+		return true;
+	};
 	if (GetSize(select) >= 2) {
 		ArithmeticPlan exclusion = make_exclusion_plan(expressions, defined, binary);
-		if (!exclusion.empty()) {
-			ArithmeticCost alternative = cost_plan(index, rewrite.region, output, select, exclusion);
-			if (alternative.gain() > cost.gain() ||
-					(alternative.gain() == cost.gain() && alternative.selected_bits < cost.selected_bits)) {
-				plan = std::move(exclusion);
-				cost = std::move(alternative);
+		if (!exclusion.empty() && apply(exclusion, "arith-excluded-term"))
+			return true;
+	}
+	return apply(make_column_plan(expressions, defined), "arith-common-columns");
+}
+
+struct ModuloRelation
+{
+	SigSpec base;
+	Const residue, upper;
+	pool<Cell *> region;
+	bool selection = false;
+};
+
+struct ModuloTrace
+{
+	PmuxCoarseIndex &index;
+	const Const modulus;
+	int power_of_two = -1;
+	int remaining = 4096;
+	pool<Cell *> active;
+
+	ModuloTrace(PmuxCoarseIndex &index, const Const &modulus) : index(index), modulus(modulus)
+	{
+		int power;
+		if (SigSpec(modulus).is_onehot(&power))
+			power_of_two = power;
+	}
+
+	std::vector<ModuloRelation> trace(SigSpec signal, int depth = 0)
+	{
+		if (signal.empty() || (remaining -= GetSize(signal)) < 0)
+			return {};
+		signal = trim_zero_extension(signal);
+		int width = GetSize(signal);
+		Const upper(State::S0, width);
+		for (int i = 0; i < width; i++)
+			if (signal[i] != State::S0)
+				upper.set(i, State::S1);
+		// The signal itself is also a possible shared base, including when it has an offset from a deeper base.
+		std::vector<ModuloRelation> relations;
+		relations.push_back({signal, Const(State::S0, GetSize(modulus)), std::move(upper), {}, false});
+		if (depth >= 16)
+			return relations;
+
+		Cell *driver = index.driver(signal[0]);
+		if (driver && driver->type.in(ID($add), ID($pos), ID($mux), ID($pmux)) && index.editable(driver)) {
+			SigSpec output = index.port(driver, ID::Y);
+			if (GetSize(output) >= width && output.extract(0, width) == signal) {
+				if (!active.insert(driver).second)
+					return {};
+				auto expanded = driver->type.in(ID($add), ID($pos))
+					? trace_offset(driver, width, depth)
+					: trace_selection(driver, width, GetSize(output), depth);
+				active.erase(driver);
+				for (auto &relation : expanded) {
+					relation.region.insert(driver);
+					relations.push_back(std::move(relation));
+				}
 			}
 		}
+		return relations;
 	}
-	if (cost.gain() <= 0 || !cost.remove.count(root))
-		return false;
 
-	log("  Rewriting arithmetic at %s.%s (%d cells removed, %d added).\n",
-		log_id(index.module), log_id(root), GetSize(cost.remove), cost.added);
-	SigSpec target = root->getPort(ID::Y);
-	for (auto cell : cost.remove)
-		index.module->remove(cell);
-	SigSpec result = emit_arithmetic(index.module, plan, select, width);
-	index.module->connect(target, result);
-	return true;
+	std::vector<ModuloRelation> trace_offset(Cell *driver, int width, int depth)
+	{
+		bool unary = driver->type == ID($pos);
+		if (driver->getParam(ID::A_SIGNED).as_bool() && (unary || driver->getParam(ID::B_SIGNED).as_bool()))
+			return {};
+		SigSpec base = index.port(driver, ID::A);
+		if (unary)
+			return trace(base.extract(0, std::min(width, GetSize(base))), depth + 1);
+		SigSpec offset = index.port(driver, ID::B);
+		if (base.is_fully_const() && !offset.is_fully_const())
+			std::swap(base, offset);
+		if (offset.empty() || !offset.is_fully_def() || (remaining -= GetSize(offset)) < 0)
+			return {};
+
+		Const capacity(State::S0, width + 1);
+		capacity.set(width, State::S1);
+		Const increment = offset.as_const();
+		bool wrap_preserves_residue = power_of_two >= 0 && power_of_two <= width;
+		std::vector<ModuloRelation> relations;
+		for (auto &relation : trace(base, depth + 1)) {
+			int calc_width = std::max({width, GetSize(increment), GetSize(modulus), GetSize(relation.upper)}) + 1;
+			auto sum = const_add(relation.upper, increment, false, false, calc_width);
+			bool no_wrap = const_lt(sum, capacity, false, false, 1).as_bool();
+			if (!no_wrap && !wrap_preserves_residue)
+				continue;
+			relation.upper = no_wrap ? std::move(sum) : Const(State::S1, width);
+			auto accumulated = const_add(relation.residue, increment, false, false, calc_width);
+			relation.residue = const_mod(accumulated, modulus, false, false, GetSize(modulus));
+			relations.push_back(std::move(relation));
+		}
+		return relations;
+	}
+
+	std::vector<ModuloRelation> trace_selection(Cell *driver, int width, int branch_width, int depth)
+	{
+		SigSpec select = index.port(driver, ID::S);
+		SigSpec fallback = index.port(driver, ID::A);
+		SigSpec data = index.port(driver, ID::B);
+		int count = GetSize(select);
+		if (count == 0 || count > 64 || GetSize(fallback) != branch_width ||
+				GetSize(data) / count != branch_width || GetSize(data) % count != 0)
+			return {};
+
+		std::vector<ModuloRelation> relations;
+		bool first = true;
+		for (int i = -1; i < count; i++) {
+			SigSpec branch = i == -1 ? fallback.extract(0, width) : data.extract(i * branch_width, width);
+			if (branch.is_fully_const() && branch.as_const().is_fully_undef_x_only())
+				continue;
+			auto alternatives = trace(branch, depth + 1);
+			if (first) {
+				relations = std::move(alternatives);
+				first = false;
+			} else {
+				std::vector<ModuloRelation> intersection;
+				for (auto &relation : relations) {
+					auto other = std::find_if(alternatives.begin(), alternatives.end(), [&](const ModuloRelation &candidate) {
+						return relation.base == candidate.base && relation.residue == candidate.residue;
+					});
+					if (other == alternatives.end())
+						continue;
+					if (const_lt(relation.upper, other->upper, false, false, 1).as_bool())
+						relation.upper = other->upper;
+					relation.region.insert(other->region.begin(), other->region.end());
+					intersection.push_back(std::move(relation));
+				}
+				relations = std::move(intersection);
+			}
+			if (relations.empty())
+				break;
+		}
+		for (auto &relation : relations)
+			relation.selection = true;
+		return relations;
+	}
+};
+
+bool rewrite_modulo(PmuxCoarseIndex &index, Cell *root)
+{
+	if (!index.editable(root) || (root->getParam(ID::A_SIGNED).as_bool() && root->getParam(ID::B_SIGNED).as_bool()))
+		return false;
+	SigSpec modulus = index.port(root, ID::B);
+	if (modulus.empty() || GetSize(modulus) > 4096 || !modulus.is_fully_def() || modulus.is_fully_zero())
+		return false;
+	SigSpec original = index.port(root, ID::A);
+	ModuloTrace tracer{index, trim_zero_extension(modulus).as_const()};
+	auto relations = tracer.trace(original);
+	if (tracer.remaining < 0)
+		return false;
+	// 追踪先记录当前信号，再记录更深的基底。
+	for (auto it = relations.rbegin(); it != relations.rend(); ++it) {
+		auto &relation = *it;
+		if (!relation.selection || !relation.residue.is_fully_zero() || relation.base == original)
+			continue;
+		relation.region.insert(root);
+		PmuxRewrite candidate(index.module, index, "arith-modulo-congruence");
+		SigSpec result(candidate.staging.addWire(NEW_ID, GetSize(root->getPort(ID::Y))));
+		Cell *replacement = candidate.staging.addCell(NEW_ID, root);
+		replacement->setPort(ID::A, relation.base);
+		replacement->setPort(ID::B, modulus);
+		replacement->setPort(ID::Y, result);
+		replacement->setParam(ID::A_WIDTH, GetSize(relation.base));
+		if (!prepare_arithmetic_rewrite(candidate, index, root, relation.region, result))
+			continue;
+		if (GetSize(relation.base) >= GetSize(original) && candidate.removed.size() == 1)
+			continue;
+		if (!candidate.validate())
+			continue;
+		log("  Reducing constant modulo at %s.%s (%d cells removed, %d added).\n",
+			log_id(index.module), log_id(root), GetSize(candidate.removed), candidate.added_count());
+		candidate.commit();
+		return true;
+	}
+	return false;
 }
 
 struct OptPmuxArithPass : public Pass
@@ -433,7 +617,8 @@ struct OptPmuxArithPass : public Pass
 		log("    opt_pmux_arith [selection]\n");
 		log("\n");
 		log("Simplify additions and subtractions modulo the result width and share\n");
-		log("arithmetic across $mux and $pmux branches when this removes RTLIL cells.\n");
+		log("arithmetic across $mux and $pmux branches by eliminating redundant operators.\n");
+		log("Reduce unsigned constant modulo by proving congruence across branches.\n");
 		log("\n");
 	}
 
@@ -452,12 +637,22 @@ struct OptPmuxArithPass : public Pass
 			if (module->has_processes_warn())
 				continue;
 			PmuxCoarseIndex index(module);
-			std::vector<IdString> selections, operators;
+			std::vector<IdString> modulos, selections, operators;
 			for (Cell *cell : module->selected_cells()) {
-				if (cell->type.in(ID($mux), ID($pmux)))
+				if (cell->type.in(ID($mod), ID($modfloor)))
+					modulos.push_back(cell->name);
+				else if (cell->type.in(ID($mux), ID($pmux)))
 					selections.push_back(cell->name);
 				else if (arithmetic_type(cell->type))
 					operators.push_back(cell->name);
+			}
+			std::sort(modulos.begin(), modulos.end());
+			std::sort(selections.begin(), selections.end());
+			std::sort(operators.begin(), operators.end());
+			for (IdString name : modulos) {
+				Cell *cell = module->cell(name);
+				if (cell && rewrite_modulo(index, cell))
+					design->scratchpad_set_bool("opt.did_something", true);
 			}
 			selections.insert(selections.end(), operators.begin(), operators.end());
 			bool external_inputs = !instantiated.count(module->name);

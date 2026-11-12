@@ -92,6 +92,7 @@ class PmuxCoarseIndex
 		return !kept_bits.count(bit);
 	}
 
+public:
 	static bool combinational_input(IdString type, IdString port)
 	{
 		if (type.in(ID($ff), ID($dff), ID($dffe), ID($sdff), ID($sdffe), ID($sdffce)))
@@ -105,7 +106,6 @@ class PmuxCoarseIndex
 		return true;
 	}
 
-public:
 	using Port = ModIndex::PortInfo;
 	Module *const module;
 	const SigMap &sigmap;

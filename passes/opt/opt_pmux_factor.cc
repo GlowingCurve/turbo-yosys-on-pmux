@@ -1,8 +1,9 @@
 #include "kernel/log.h"
 #include "kernel/register.h"
-#include "pmux_coarse.h"
+#include "pmux_rewrite.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <optional>
 #include <set>
@@ -23,7 +24,7 @@ struct FactorChoice
 
 	static std::optional<FactorChoice> read(PmuxCoarseIndex &index, Cell *cell)
 	{
-		if (!cell->type.in(ID($mux), ID($pmux)) || !index.editable(cell))
+		if (!cell->type.in(ID($mux), ID($pmux)))
 			return std::nullopt;
 		SigSpec select = index.port(cell, ID::S);
 		SigSpec a = index.port(cell, ID::A);
@@ -63,90 +64,53 @@ SigSpec emit_choice(Module *module, const SigSpec &select, const std::vector<Sig
 		: module->Pmux(NEW_ID, values.front(), cases, select);
 }
 
-Cell *whole_driver(PmuxCoarseIndex &index, const SigSpec &value)
+std::optional<std::pair<Cell *, FactorChoice>> choice_input(PmuxCoarseIndex &index, const SigSpec &value)
 {
 	if (value.empty())
-		return nullptr;
+		return std::nullopt;
 	Cell *cell = index.driver(value[0]);
-	if (!cell || !cell->type.in(ID($mux), ID($pmux), ID($and), ID($or), ID($xor), ID($xnor)))
-		return nullptr;
-	return index.port(cell, ID::Y) == value && index.editable(cell) ? cell : nullptr;
-}
+	if (!cell)
+		return std::nullopt;
+	auto choice = FactorChoice::read(index, cell);
+	if (!choice)
+		return std::nullopt;
 
-pool<Cell *> profitable_removal(PmuxCoarseIndex &index, Cell *root, const pool<Cell *> &region,
-		const std::vector<SigSpec> &inputs, int added)
-{
-	pool<SigBit> input_bits, output_bits;
-	for (const auto &input : inputs)
-		for (auto bit : input)
-			input_bits.insert(bit);
-	for (auto bit : index.port(root, ID::Y))
-		output_bits.insert(bit);
-	if (!index.independent(input_bits, output_bits))
-		return {};
-	auto removable = index.removable(region, {}, output_bits, input_bits);
-	if (GetSize(removable) <= added || !removable.count(root))
-		return {};
-	return removable;
-}
-
-SigSpec remove_region(PmuxCoarseIndex &index, Cell *root, const pool<Cell *> &removable, int added)
-{
-	log("  Factoring selection at %s.%s (%d cells removed, %d added).\n",
-		log_id(index.module), log_id(root), GetSize(removable), added);
-	SigSpec output = root->getPort(ID::Y);
-	for (Cell *cell : removable)
-		index.module->remove(cell);
-	return output;
-}
-
-bool factor_nested_choice(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice,
-		const std::vector<Cell *> &drivers)
-{
-	Cell *seed = nullptr;
-	for (Cell *driver : drivers)
-		if (driver && driver->type == ID($mux)) {
-			seed = driver;
-			break;
-		}
-	if (!seed)
-		return false;
-
-	SigSpec a = index.port(seed, ID::A);
-	SigSpec b = index.port(seed, ID::B);
-	pool<Cell *> region{root};
-	std::vector<SigSpec> conditions;
-	for (int i = 0; i < GetSize(choice.branches); i++) {
-		const SigSpec &branch = choice.branches[i];
-		Cell *driver = drivers[i];
-		if (unspecified(branch))
-			conditions.emplace_back(State::Sx);
-		else if (branch == a)
-			conditions.emplace_back(State::S0);
-		else if (branch == b)
-			conditions.emplace_back(State::S1);
-		else if (driver && driver->type == ID($mux) && index.port(driver, ID::A) == a && index.port(driver, ID::B) == b) {
-			conditions.push_back(index.port(driver, ID::S));
-			region.insert(driver);
-		} else {
-			return false;
+	std::vector<int> offsets;
+	for (auto bit : value) {
+		auto source = index.source(bit);
+		if (!source || source->cell != cell || source->port != ID::Y)
+			return std::nullopt;
+		offsets.push_back(source->offset);
+	}
+	if (index.port(cell, ID::Y) != value) {
+		for (auto &branch : choice->branches) {
+			SigSpec field;
+			for (int offset : offsets)
+				field.append(branch[offset]);
+			branch = std::move(field);
 		}
 	}
+	return std::make_pair(cell, std::move(*choice));
+}
 
-	std::optional<SigSpec> common = common_value(conditions);
-	std::vector<SigSpec> inputs = common ? std::vector<SigSpec>{*common} : conditions;
-	if (!common)
-		inputs.push_back(choice.select);
-	inputs.push_back(a);
-	inputs.push_back(b);
-	int added = 1 + int(!common);
-	auto removable = profitable_removal(index, root, region, inputs, added);
-	if (removable.empty())
-		return false;
-	SigSpec output = remove_region(index, root, removable, added);
-	SigSpec condition = emit_choice(index.module, choice.select, conditions);
-	index.module->addMux(NEW_ID, a, b, condition, output);
-	return true;
+bool prepare_factor(PmuxCoarseIndex &index, Cell *root, const pool<Cell *> &region, PmuxRewrite &rewrite)
+{
+	pool<SigBit> input_bits, output_bits;
+	auto retain = [&](const SigSpec &input) {
+		for (auto bit : input)
+			if (bit.wire && bit.wire->module == index.module)
+				input_bits.insert(bit);
+	};
+	for (Cell *cell : rewrite.staging.cells())
+		for (const auto &[port, signal] : cell->connections())
+			if (cell->input(port))
+				retain(signal);
+	for (const auto &connection : rewrite.staging.connections())
+		retain(connection.second);
+	for (auto bit : index.port(root, ID::Y))
+		output_bits.insert(bit);
+	rewrite.removed = index.removable(region, {}, output_bits, input_bits);
+	return rewrite.removed.count(root);
 }
 
 bool bitwise_type(IdString type)
@@ -154,84 +118,243 @@ bool bitwise_type(IdString type)
 	return type.in(ID($and), ID($or), ID($xor), ID($xnor));
 }
 
-std::pair<SigSpec, SigSpec> bitwise_operands(PmuxCoarseIndex &index, Cell *cell)
+struct FactorDriver
 {
-	int width = GetSize(index.port(cell, ID::Y));
-	bool is_signed = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-	SigSpec a = index.port(cell, ID::A);
-	SigSpec b = index.port(cell, ID::B);
-	a.extend_u0(width, is_signed);
-	b.extend_u0(width, is_signed);
-	return {a, b};
-}
+	SigSpec a, b;
+	SigBit select;
 
-bool factor_bitwise(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice,
-		const std::vector<Cell *> &drivers, IdString type, const SigSpec &common_operand)
+	static FactorDriver read(PmuxCoarseIndex &index, Cell *cell)
+	{
+		auto a = index.port(cell, ID::A);
+		auto b = index.port(cell, ID::B);
+		if (cell->type == ID($mux))
+			return {a, b, index.port(cell, ID::S).as_bit()};
+		bool is_signed = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
+		int width = GetSize(cell->getPort(ID::Y));
+		a.extend_u0(width, is_signed);
+		b.extend_u0(width, is_signed);
+		return {a, b, {}};
+	}
+};
+
+struct FactorBit
 {
-	std::vector<SigSpec> operands;
-	pool<Cell *> region{root};
-	for (int i = 0; i < GetSize(choice.branches); i++) {
-		const SigSpec &branch = choice.branches[i];
-		if (unspecified(branch)) {
-			operands.push_back(branch);
-			continue;
-		}
-		if (branch == common_operand) {
-			State identity = type.in(ID($and), ID($xnor)) ? State::S1 : State::S0;
-			operands.emplace_back(identity, GetSize(branch));
-			continue;
-		}
-		Cell *driver = drivers[i];
-		if (!driver || driver->type != type)
-			return false;
-		auto [a, b] = bitwise_operands(index, driver);
-		if (b == common_operand)
-			std::swap(a, b);
-		if (a != common_operand)
-			return false;
-		operands.push_back(b);
-		region.insert(driver);
+	SigBit value;
+	Cell *producer;
+	SigBit a, b, select;
+
+	static FactorBit read(PmuxCoarseIndex &index, dict<Cell *, FactorDriver> &drivers, SigBit bit)
+	{
+		auto source = index.source(bit);
+		if (!source || source->port != ID::Y ||
+				(source->cell->type != ID($mux) && !bitwise_type(source->cell->type)))
+			return {bit, nullptr, {}, {}, {}};
+		Cell *cell = source->cell;
+		auto entry = drivers.find(cell);
+		if (entry == drivers.end())
+			entry = drivers.emplace(cell, FactorDriver::read(index, cell)).first;
+		const auto &driver = entry->second;
+		return {bit, cell, driver.a[source->offset], driver.b[source->offset], driver.select};
+	}
+};
+
+struct FactorField
+{
+	IdString type;
+	std::vector<int> offsets;
+	SigSpec a, b;
+	std::vector<SigSpec> branches;
+	pool<Cell *> producers;
+
+	bool operator==(const FactorField &other) const
+	{
+		return std::tie(type, offsets, a, b, branches) == std::tie(other.type, other.offsets, other.a, other.b, other.branches);
 	}
 
-	std::optional<SigSpec> common = common_value(operands);
-	std::vector<SigSpec> inputs = common ? std::vector<SigSpec>{*common} : operands;
-	if (!common)
-		inputs.push_back(choice.select);
-	inputs.push_back(common_operand);
-	int added = 1 + int(!common);
-	auto removable = profitable_removal(index, root, region, inputs, added);
-	if (removable.empty())
-		return false;
-	SigSpec output = remove_region(index, root, removable, added);
-	SigSpec operand = emit_choice(index.module, choice.select, operands);
-	if (type == ID($and))
-		index.module->addAnd(NEW_ID, common_operand, operand, output);
-	else if (type == ID($or))
-		index.module->addOr(NEW_ID, common_operand, operand, output);
-	else if (type == ID($xor))
-		index.module->addXor(NEW_ID, common_operand, operand, output);
-	else
-		index.module->addXnor(NEW_ID, common_operand, operand, output);
-	return true;
+	SigSpec emit(Module *module, const SigSpec &select) const
+	{
+		auto input = emit_choice(module, select, branches);
+		if (type == ID($mux))
+			return module->Mux(NEW_ID, a, b, input);
+		Wire *output = module->addWire(NEW_ID, GetSize(a));
+		if (type == ID($and))
+			module->addAnd(NEW_ID, a, input, output);
+		else if (type == ID($or))
+			module->addOr(NEW_ID, a, input, output);
+		else if (type == ID($xor))
+			module->addXor(NEW_ID, a, input, output);
+		else
+			module->addXnor(NEW_ID, a, input, output);
+		return output;
+	}
+};
+
+void match_nested_fields(int offset, const std::vector<FactorBit> &bits,
+		std::map<std::vector<SigBit>, FactorField> &fields)
+{
+	for (const auto &seed : bits) {
+		if (!seed.producer || seed.producer->type != ID($mux))
+			continue;
+		std::vector<SigBit> conditions;
+		pool<Cell *> producers;
+		for (const auto &branch : bits) {
+			if (branch.value == State::Sx)
+				conditions.emplace_back(State::Sx);
+			else if (branch.value == seed.a)
+				conditions.emplace_back(State::S0);
+			else if (branch.value == seed.b)
+				conditions.emplace_back(State::S1);
+			else if (branch.producer && branch.producer->type == ID($mux) && branch.a == seed.a && branch.b == seed.b) {
+				conditions.push_back(branch.select);
+				producers.insert(branch.producer);
+			} else {
+				break;
+			}
+		}
+		if (conditions.size() != bits.size() || producers.empty())
+			continue;
+		auto &field = fields[conditions];
+		if (field.offsets.empty()) {
+			field.type = ID($mux);
+			for (auto condition : conditions)
+				field.branches.emplace_back(condition);
+		}
+		field.offsets.push_back(offset);
+		field.a.append(seed.a);
+		field.b.append(seed.b);
+		field.producers.insert(producers.begin(), producers.end());
+		break;
+	}
+}
+
+void match_bitwise_field(FactorField &field, int offset, const std::vector<FactorBit> &bits, SigBit common)
+{
+	std::vector<SigBit> operands;
+	pool<Cell *> producers;
+	for (const auto &branch : bits) {
+		if (branch.value == State::Sx) {
+			operands.push_back(branch.value);
+			continue;
+		}
+		if (branch.value == common) {
+			operands.emplace_back(field.type.in(ID($and), ID($xnor)) ? State::S1 : State::S0);
+			continue;
+		}
+		if (!branch.producer || branch.producer->type != field.type || (branch.a != common && branch.b != common))
+			return;
+		operands.push_back(branch.a == common ? branch.b : branch.a);
+		producers.insert(branch.producer);
+	}
+	if (producers.empty())
+		return;
+	field.offsets.push_back(offset);
+	field.a.append(common);
+	field.producers.insert(producers.begin(), producers.end());
+	field.branches.resize(operands.size());
+	for (int i = 0; i < GetSize(operands); ++i)
+		field.branches[i].append(operands[i]);
+}
+
+void match_bitwise_fields(int offset, const std::vector<FactorBit> &bits,
+		std::array<std::map<IdString, FactorField>, 2> &fields)
+{
+	pool<IdString> matched_types;
+	for (const auto &seed : bits) {
+		if (!seed.producer || !bitwise_type(seed.producer->type) || !matched_types.insert(seed.producer->type).second)
+			continue;
+		for (int variant = 0; variant < GetSize(fields); ++variant) {
+			auto &field = fields[variant][seed.producer->type];
+			field.type = seed.producer->type;
+			int size = GetSize(field.offsets);
+			match_bitwise_field(field, offset, bits, variant == 0 ? seed.a : seed.b);
+			if (GetSize(field.offsets) == size && seed.a != seed.b)
+				match_bitwise_field(field, offset, bits, variant == 0 ? seed.b : seed.a);
+		}
+	}
 }
 
 bool factor_choice(PmuxCoarseIndex &index, Cell *root)
 {
 	auto choice = FactorChoice::read(index, root);
-	if (!choice)
+	if (!choice || !index.editable(root))
 		return false;
-	std::vector<Cell *> drivers;
-	for (const auto &branch : choice->branches)
-		drivers.push_back(whole_driver(index, branch));
-	if (factor_nested_choice(index, root, *choice, drivers))
-		return true;
-	for (Cell *driver : drivers) {
-		if (!driver || !bitwise_type(driver->type))
-			continue;
-		auto [a, b] = bitwise_operands(index, driver);
-		return factor_bitwise(index, root, *choice, drivers, driver->type, a) ||
-			factor_bitwise(index, root, *choice, drivers, driver->type, b);
+	SigSpec output = root->getPort(ID::Y);
+	std::map<std::vector<SigBit>, FactorField> nested;
+	std::array<std::map<IdString, FactorField>, 2> bitwise;
+	dict<Cell *, FactorDriver> drivers;
+	std::vector<FactorBit> bits;
+	bits.reserve(choice->branches.size());
+	for (int offset = 0; offset < GetSize(output); ++offset) {
+		bits.clear();
+		for (const auto &branch : choice->branches)
+			bits.push_back(FactorBit::read(index, drivers, branch[offset]));
+		match_nested_fields(offset, bits, nested);
+		match_bitwise_fields(offset, bits, bitwise);
 	}
+
+	auto apply = [&](const std::vector<const FactorField *> &fields) {
+		pool<Cell *> region{root};
+		for (const auto *field : fields)
+			region.insert(field->producers.begin(), field->producers.end());
+
+		PmuxRewrite rewrite(index.module, index, "factor choice fields");
+		pool<int> factored;
+		for (const auto *field : fields) {
+			SigSpec field_output;
+			for (int offset : field->offsets) {
+				factored.insert(offset);
+				field_output.append(output[offset]);
+			}
+			rewrite.connect(field_output, field->emit(&rewrite.staging, choice->select));
+		}
+		SigSpec remaining_output;
+		std::vector<SigSpec> remaining_branches(choice->branches.size());
+		for (int offset = 0; offset < GetSize(output); ++offset) {
+			if (factored.count(offset))
+				continue;
+			remaining_output.append(output[offset]);
+			for (int branch = 0; branch < GetSize(remaining_branches); ++branch)
+				remaining_branches[branch].append(choice->branches[branch][offset]);
+		}
+		if (!remaining_output.empty())
+			rewrite.connect(remaining_output, emit_choice(&rewrite.staging, choice->select, remaining_branches));
+		if (!prepare_factor(index, root, region, rewrite))
+			return false;
+		for (const auto *field : fields)
+			if (std::none_of(field->producers.begin(), field->producers.end(), [&](Cell *cell) { return rewrite.removed.count(cell); }))
+				return false;
+		if (!rewrite.validate())
+			return false;
+		rewrite.commit();
+		return true;
+	};
+	std::vector<const FactorField *> nested_fields;
+	for (const auto &[conditions, field] : nested)
+		nested_fields.push_back(&field);
+	auto single_fields = nested_fields;
+	for (int variant = 0; variant < GetSize(bitwise); ++variant) {
+		if (variant == 1 && bitwise[0] == bitwise[1])
+			break;
+		auto fields = nested_fields;
+		pool<int> occupied;
+		for (const auto *field : fields)
+			occupied.insert(field->offsets.begin(), field->offsets.end());
+		for (const auto &[type, field] : bitwise[variant]) {
+			if (field.offsets.empty())
+				continue;
+			if (variant == 0 || !(field == bitwise[0].at(type)))
+				single_fields.push_back(&field);
+			if (std::none_of(field.offsets.begin(), field.offsets.end(), [&](int offset) { return occupied.count(offset); })) {
+				fields.push_back(&field);
+				occupied.insert(field.offsets.begin(), field.offsets.end());
+			}
+		}
+		if (GetSize(fields) > 1 && apply(fields))
+			return true;
+	}
+	for (const auto *field : single_fields)
+		if (apply({field}))
+			return true;
 	return false;
 }
 
@@ -282,21 +405,63 @@ std::optional<ReducedValue> normalize_reduction(IdString type, const SigSpec &in
 	return ReducedValue{type, operands};
 }
 
-bool factor_reduction(PmuxCoarseIndex &index, Cell *root)
+using ReductionResults = std::map<ReducedValue, std::vector<IdString>>;
+
+void record_reduction(PmuxCoarseIndex &index, Cell *cell, ReductionResults &available)
+{
+	if (GetSize(cell->getPort(ID::Y)) != 1)
+		return;
+	auto input = index.port(cell, ID::A);
+	if (cell->type == ID($not)) {
+		if (GetSize(input) == 1)
+			available[{ID($not), input}].push_back(cell->name);
+		return;
+	}
+	auto value = normalize_reduction(cell->type, input);
+	if (!value || value->type.empty())
+		return;
+	if (cell->type.in(ID($reduce_xor), ID($reduce_xnor))) {
+		int wire_bits = 0;
+		for (SigBit bit : input)
+			wire_bits += bit.wire != nullptr;
+		// 被抵消的重复位在原单元中仍可能传播未定义值。
+		if (wire_bits != GetSize(value->input))
+			return;
+	}
+	available[*value].push_back(cell->name);
+}
+
+std::optional<SigSpec> find_reduction(PmuxCoarseIndex &index, Cell *root, const ReducedValue &value,
+		const ReductionResults &available)
+{
+	auto found = available.find(value);
+	if (found == available.end())
+		return std::nullopt;
+	pool<SigBit> outputs{index.port(root, ID::Y).as_bit()};
+	for (auto name : found->second) {
+		auto cell = index.module->cell(name);
+		if (!cell || cell == root)
+			continue;
+		auto output = index.port(cell, ID::Y);
+		auto bit = output.as_bit();
+		if (index.driver(bit) == cell && index.independent({bit}, outputs))
+			return output;
+	}
+	return std::nullopt;
+}
+
+bool factor_reduction(PmuxCoarseIndex &index, Cell *root, ReductionResults &available)
 {
 	if (!index.editable(root) || GetSize(index.port(root, ID::Y)) != 1)
 		return false;
-	SigSpec input = index.port(root, ID::A);
-	Cell *mux = whole_driver(index, input);
-	if (!mux)
+	auto source = choice_input(index, index.port(root, ID::A));
+	if (!source)
 		return false;
-	auto choice = FactorChoice::read(index, mux);
-	if (!choice)
-		return false;
+	auto &[mux, choice] = *source;
 
 	std::set<ReducedValue> unique;
 	std::vector<ReducedValue> values;
-	for (const auto &branch : choice->branches) {
+	for (const auto &branch : choice.branches) {
 		if (unspecified(branch)) {
 			values.push_back({IdString(), SigSpec(State::Sx)});
 			continue;
@@ -309,39 +474,40 @@ bool factor_reduction(PmuxCoarseIndex &index, Cell *root)
 	}
 	if (unique.empty())
 		return false;
-	bool select = GetSize(unique) > 1;
-	int added = int(select);
-	std::vector<SigSpec> inputs;
-	for (const auto &value : unique) {
-		inputs.push_back(value.input);
-		added += !value.type.empty();
-	}
-	if (select)
-		inputs.push_back(choice->select);
-	auto removable = profitable_removal(index, root, {root, mux}, inputs, added);
-	if (removable.empty())
-		return false;
 
-	SigSpec output = remove_region(index, root, removable, added);
+	PmuxRewrite candidate(index.module, index, "factor reduction");
 	std::map<ReducedValue, SigSpec> results;
+	std::vector<IdString> added;
 	for (const auto &value : unique) {
 		if (value.type.empty()) {
 			results[value] = value.input;
 			continue;
 		}
-		Wire *wire = index.module->addWire(NEW_ID);
-		Cell *reduction = index.module->addCell(NEW_ID, value.type);
+		if (auto result = find_reduction(index, root, value, available)) {
+			results[value] = *result;
+			continue;
+		}
+		Wire *wire = candidate.staging.addWire(NEW_ID);
+		Cell *reduction = candidate.staging.addCell(NEW_ID, value.type);
 		reduction->setParam(ID::A_WIDTH, GetSize(value.input));
 		reduction->setParam(ID::A_SIGNED, false);
 		reduction->setParam(ID::Y_WIDTH, 1);
 		reduction->setPort(ID::A, value.input);
 		reduction->setPort(ID::Y, wire);
 		results[value] = wire;
+		added.push_back(reduction->name);
 	}
 	std::vector<SigSpec> branches;
 	for (const auto &value : values)
 		branches.push_back(unspecified(value.input) ? value.input : results.at(value));
-	index.module->connect(output, emit_choice(index.module, choice->select, branches));
+	auto common = common_value(branches);
+	candidate.connect(root->getPort(ID::Y), common ? *common : emit_choice(&candidate.staging, choice.select, branches));
+	if (!prepare_factor(index, root, {root, mux}, candidate) ||
+			((!added.empty() || !common) && !candidate.removed.count(mux)) || !candidate.validate())
+		return false;
+	candidate.commit();
+	for (auto name : added)
+		record_reduction(index, index.module->cell(name), available);
 	return true;
 }
 
@@ -354,8 +520,9 @@ struct OptPmuxFactorPass : public Pass
 		log("\n");
 		log("    opt_pmux_factor [selection]\n");
 		log("\n");
-		log("Factor common bitwise operations or nested muxes across selections,\n");
-		log("and move reductions to their input branches when this removes RTLIL cells.\n");
+		log("Factor common bitwise operations or nested muxes across output fields,\n");
+		log("and move reductions to their input branches when the selection can be\n");
+		log("removed or all defined branches share one reusable reduction result.\n");
 		log("\n");
 	}
 
@@ -369,16 +536,24 @@ struct OptPmuxFactorPass : public Pass
 			if (module->has_processes_warn())
 				continue;
 			PmuxCoarseIndex index(module);
+			ReductionResults available;
 			std::vector<IdString> choices, reductions;
+			for (Cell *cell : module->cells())
+				if (reduction_type(cell->type) || cell->type == ID($not))
+					record_reduction(index, cell, available);
+			for (auto &[value, names] : available)
+				std::sort(names.begin(), names.end());
 			for (Cell *cell : module->selected_cells()) {
 				if (cell->type.in(ID($mux), ID($pmux)))
 					choices.push_back(cell->name);
 				else if (reduction_type(cell->type))
 					reductions.push_back(cell->name);
 			}
+			std::sort(reductions.begin(), reductions.end());
+			std::sort(choices.begin(), choices.end());
 			for (IdString name : reductions) {
 				Cell *cell = module->cell(name);
-				if (cell && factor_reduction(index, cell))
+				if (cell && factor_reduction(index, cell, available))
 					design->scratchpad_set_bool("opt.did_something", true);
 			}
 			for (IdString name : choices) {
