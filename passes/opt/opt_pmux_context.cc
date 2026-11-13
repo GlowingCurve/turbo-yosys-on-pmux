@@ -673,14 +673,14 @@ struct ContextRewrite
 		for (auto bit : index.port(consumer, ID::Y))
 			outputs.insert(bit);
 		candidates.insert(consumer);
-		auto removed = index.removable(candidates, {}, outputs, retained);
-		if (!removed.count(consumer) || std::any_of(needed.begin(), needed.end(), [&](int i) {
-			return !removed.count(nodes[i].original);
+
+		PmuxRewrite rewrite(index.module, index, "context");
+		rewrite.find_removable(candidates, {}, outputs, retained);
+		if (!rewrite.removed.count(consumer) || std::any_of(needed.begin(), needed.end(), [&](int i) {
+			return !rewrite.removed.count(nodes[i].original);
 		}))
 			return false;
 
-		PmuxRewrite rewrite(index.module, index, "context");
-		rewrite.removed = std::move(removed);
 		std::vector<Wire *> wires(nodes.size(), nullptr);
 		for (int i = 0; i < GetSize(nodes); i++) {
 			if (!needed.count(i))

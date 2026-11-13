@@ -193,16 +193,29 @@ class PmuxSelectTree
 		return result;
 	}
 
-	pool<int> reachable(const std::vector<int> &roots) const
+public:
+	struct Analysis {
+		std::vector<bool> live;
+		std::vector<SigBit> literals;
+		int mux_bits = 0, data_end = 0;
+	};
+
+	Analysis analyze(const std::vector<int> &roots) const
 	{
-		pool<int> seen;
+		Analysis result;
+		result.live.resize(nodes.size());
 		std::vector<int> pending = roots;
 		while (!pending.empty()) {
 			int id = pending.back();
 			pending.pop_back();
-			if (!seen.insert(id).second)
+			if (result.live[id])
 				continue;
+			result.live[id] = true;
 			const auto &node = nodes[id];
+			result.mux_bits += node.op == Op::mux;
+			result.data_end = std::max(result.data_end, node.stage);
+			if (node.op == Op::literal && node.bit.wire)
+				result.literals.push_back(node.bit);
 			if (node.a >= 0)
 				pending.push_back(node.a);
 			if (node.b >= 0)
@@ -210,10 +223,9 @@ class PmuxSelectTree
 			if (node.select >= 0)
 				pending.push_back(node.select);
 		}
-		return seen;
+		return result;
 	}
 
-public:
 	pool<Cell *> producers;
 
 	PmuxSelectTree(const PmuxCoarseIndex &index, const PmuxEncoding &encoding) : index(index), encoding(encoding) {}
@@ -246,41 +258,29 @@ public:
 		return values.front();
 	}
 
-	int mux_bits(const std::vector<int> &roots) const
+	pool<SigBit> inputs(const Analysis &analysis) const
 	{
-		auto live = reachable(roots);
-		return std::count_if(live.begin(), live.end(), [&](int id) { return nodes[id].op == Op::mux; });
+		// 保持旧的可达节点集合遍历顺序。
+		return pool<SigBit>(analysis.literals.rbegin(), analysis.literals.rend());
 	}
 
-	pool<SigBit> inputs(const std::vector<int> &roots) const
+	SigSpec emit(Module *module, const std::vector<int> &roots, const std::string &src, const Analysis &analysis) const
 	{
-		pool<SigBit> result;
-		for (int id : reachable(roots))
-			if (nodes[id].op == Op::literal && nodes[id].bit.wire)
-				result.insert(nodes[id].bit);
-		return result;
-	}
-
-	SigSpec emit(Module *module, const std::vector<int> &roots, const std::string &src) const
-	{
-		auto live = reachable(roots);
-		int data_end = 0;
-		for (int id : live)
-			data_end = std::max(data_end, nodes[id].stage);
 		std::vector<SigBit> signals(GetSize(nodes));
 		std::map<std::tuple<int, Op, int>, std::vector<int>> groups;
-		for (int id = 0; id < GetSize(nodes); ++id) {
-			if (!live.count(id))
+		for (int id = 0; id < GetSize(analysis.live); ++id) {
+			if (!analysis.live[id])
 				continue;
 			const auto &node = nodes[id];
 			if (node.op == Op::literal)
 				signals[id] = node.bit;
 			else
-				groups[{node.stage < 0 ? data_end - node.stage : node.stage, node.op, node.select}].push_back(id);
+				groups[{node.stage < 0 ? analysis.data_end - node.stage : node.stage, node.op, node.select}].push_back(id);
 		}
 		for (const auto &[key, ids] : groups) {
 			const auto &[stage, op, select] = key;
 			SigSpec a, b;
+			// 同一组的输出位按节点编号排列。
 			Wire *out = module->addWire(NEW_ID, GetSize(ids));
 			for (int i = 0; i < GetSize(ids); ++i) {
 				const auto &node = nodes[ids[i]];

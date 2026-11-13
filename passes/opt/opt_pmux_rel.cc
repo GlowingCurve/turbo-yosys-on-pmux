@@ -330,7 +330,7 @@ class RelationWorker
 			relation.y.append(column->output);
 		}
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, encoding ? "encoded_output_relation" : "output_relation");
-		rewrite->removed = index.removable(candidates, replaced, outputs, inputs);
+		rewrite->find_removable(candidates, replaced, outputs, inputs);
 		for (auto cell : replaced)
 			if (!rewrite->removed.count(cell))
 				return nullptr;
@@ -420,18 +420,15 @@ class RelationWorker
 					if (!(fixed & mask) && (unsigned(low) & fixed) == code.one)
 						affected.push_back(row);
 				}
+			// 签名直接读取原列，哈希相同仍需比较全部有效编码。
 			auto key = [&](const SwapColumn &column, int flip) {
-				std::vector<int> result;
-				result.reserve(rows);
-				for (int row = 0; row < rows; ++row)
-					if (row != low && row != high)
-						result.push_back(column.values[row ^ flip]);
-				return result;
+				return SwapSignature(column.values, low, high, flip);
 			};
-			dict<std::vector<int>, std::vector<int>> groups;
+			dict<SwapSignature, std::vector<int>> groups;
 			for (int col = 0; col < GetSize(columns); ++col)
 				if (!used.count(col))
 					groups[key(columns[col], 0)].push_back(col);
+
 			for (int col = 0; col < GetSize(columns); ++col) {
 				if (used.count(col))
 					continue;
@@ -455,13 +452,13 @@ class RelationWorker
 							return pairs;
 						if (!preserves_partial_swap(a, b, branches[a.cell], affected, low, high) ||
 								!preserves_partial_swap(b, a, branches[b.cell], affected, low, high))
-						continue;
-				}
+							continue;
+					}
 					used.insert(col);
 					used.insert(partner);
 					pairs.push_back({col, partner, low});
 					break;
-			}
+				}
 			}
 		}
 		return pairs;
@@ -514,12 +511,15 @@ class RelationWorker
 				offsets[column->cell].insert(column->offset);
 			}
 		}
-		if (roots.empty() || (partial && tree.mux_bits(roots) >= tree.mux_bits(reference)))
+		if (roots.empty())
+			return nullptr;
+		auto live = tree.analyze(roots);
+		if (partial && live.mux_bits >= tree.analyze(reference).mux_bits)
 			return nullptr;
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "encoded_output_swap");
-		inputs = tree.inputs(roots);
+		inputs = tree.inputs(live);
 		auto &staging = rewrite->staging;
-		rewrite->connect(swap_y, tree.emit(&staging, roots, cells.front()->get_src_attribute()));
+		rewrite->connect(swap_y, tree.emit(&staging, roots, cells.front()->get_src_attribute(), live));
 		bool combines_selections = GetSize(replaced) > 1;
 		for (int pos = 0; pos < GetSize(cells); ++pos) {
 			if (offsets[pos].empty())
@@ -551,7 +551,7 @@ class RelationWorker
 		pool<Cell *> candidates = encoding.cells;
 		candidates.insert(replaced.begin(), replaced.end());
 		candidates.insert(tree.producers.begin(), tree.producers.end());
-		rewrite->removed = index.removable(candidates, replaced, outputs, inputs);
+		rewrite->find_removable(candidates, replaced, outputs, inputs);
 		bool removes_selection_logic = std::any_of(rewrite->removed.begin(), rewrite->removed.end(), [&](auto cell) {
 			return !replaced.count(cell) || cell->type == ID($pmux);
 		});
@@ -560,6 +560,38 @@ class RelationWorker
 			return nullptr;
 		return rewrite;
 	}
+
+	struct SwapSignature {
+		const std::vector<int> *values;
+		int low, high, flip;
+		Hasher::hash_t fingerprint;
+
+		SwapSignature(const std::vector<int> &values, int low, int high, int flip)
+			: values(&values), low(low), high(high), flip(flip)
+		{
+			Hasher hash;
+			for (int row = 0; row < GetSize(values); ++row)
+				if (row != low && row != high)
+					hash.eat(values[row ^ flip]);
+			fingerprint = hash.yield();
+		}
+
+		bool operator==(const SwapSignature &other) const
+		{
+			if (fingerprint != other.fingerprint || low != other.low || high != other.high || GetSize(*values) != GetSize(*other.values))
+				return false;
+			for (int row = 0; row < GetSize(*values); ++row)
+				if (row != low && row != high && (*values)[row ^ flip] != (*other.values)[row ^ other.flip])
+					return false;
+			return true;
+		}
+
+		Hasher hash_into(Hasher hash) const
+		{
+			hash.eat(fingerprint);
+			return hash;
+		}
+	};
 
 	bool apply(std::unique_ptr<PmuxRewrite> rewrite)
 	{
@@ -643,18 +675,25 @@ class RelationWorker
 		return false;
 	}
 
-	template<typename Rewrite>
-	bool rewrite_encoded_group(const std::vector<IdString> &names, Rewrite rewrite)
+	struct EncodedGroup {
+		std::vector<Cell *> cells;
+		PmuxEncoding encoding;
+		std::vector<std::vector<int>> tables;
+	};
+
+	std::optional<EncodedGroup> analyze_encoded_group(const std::vector<IdString> &names)
 	{
 		auto cells = live_cells(names);
 		if (cells.empty())
-			return false;
+			return std::nullopt;
+		EncodedGroup group{std::move(cells), PmuxEncoding(index), {}};
 		std::vector<SigSpec> selects;
-		for (auto cell : cells)
+		selects.reserve(group.cells.size());
+		for (auto cell : group.cells)
 			selects.push_back(index.port(cell, ID::S));
-		PmuxEncoding encoding(index);
-		std::vector<std::vector<int>> tables;
-		return encoding.branch_tables(selects, tables) && rewrite(cells, encoding, tables);
+		if (!group.encoding.branch_tables(selects, group.tables))
+			return std::nullopt;
+		return group;
 	}
 
 	int share_exact_relations()
@@ -675,24 +714,27 @@ class RelationWorker
 		return changes;
 	}
 
-	bool share_encoded_relations(std::vector<IdString> &names)
+	bool share_encoded_relations(std::vector<IdString> &names, const EncodedGroup &group)
 	{
-		return rewrite_encoded_group(names, [&](const auto &cells, const auto &encoding, const auto &tables) {
-			auto rewrite = relations(cells, &encoding, tables);
-			if (!rewrite)
-				return false;
-			for (auto cell : rewrite->staging.cells())
-				if (pmux_select_shape(cell))
-					names.push_back(cell->name);
-			return apply(std::move(rewrite));
-		});
+		auto rewrite = relations(group.cells, &group.encoding, group.tables);
+		if (!rewrite)
+			return false;
+		for (auto cell : rewrite->staging.cells())
+			if (pmux_select_shape(cell))
+				names.push_back(cell->name);
+		return apply(std::move(rewrite));
 	}
 
-	bool share_output_swaps(const std::vector<IdString> &names)
+	int rewrite_encoded_group(std::vector<IdString> &names)
 	{
-		return rewrite_encoded_group(names, [&](const auto &cells, const auto &encoding, const auto &tables) {
-			return rewrite_swap(cells, encoding, tables);
-		});
+		auto group = analyze_encoded_group(names);
+		if (!group)
+			return 0;
+		if (!share_encoded_relations(names, *group))
+			return rewrite_swap(group->cells, group->encoding, group->tables);
+		group.reset();
+		auto updated = analyze_encoded_group(names);
+		return 1 + (updated && rewrite_swap(updated->cells, updated->encoding, updated->tables));
 	}
 
 public:
@@ -702,10 +744,8 @@ public:
 	{
 		int before = module->cells_size();
 		int changes = share_exact_relations();
-		for (auto &[key, names] : encoded_groups()) {
-			changes += share_encoded_relations(names);
-			changes += share_output_swaps(names);
-		}
+		for (auto &[key, names] : encoded_groups())
+			changes += rewrite_encoded_group(names);
 		if (changes)
 			log("  %s: shared selection output relations, RTLIL cell delta %+d.\n", log_id(module), module->cells_size() - before);
 	}

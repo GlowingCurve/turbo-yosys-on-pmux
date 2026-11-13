@@ -78,9 +78,12 @@ class PmuxEncoding
 	const PmuxCoarseIndex &index;
 	dict<SigBit, uint64_t> decoded;
 	pool<SigBit> active;
+	pool<SigBit> *dependencies;
 
 	std::optional<uint64_t> literal(SigBit bit)
 	{
+		if (dependencies && bit.wire)
+			dependencies->insert(bit);
 		if (!bit.wire) {
 			if (bit == State::S0)
 				return 0;
@@ -220,13 +223,15 @@ public:
 	dict<SigBit, int> slots;
 	pool<Cell *> cells;
 
-	explicit PmuxEncoding(const PmuxCoarseIndex &index) : index(index) {}
+	explicit PmuxEncoding(const PmuxCoarseIndex &index, pool<SigBit> *dependencies = nullptr) : index(index), dependencies(dependencies) {}
 
 	std::optional<uint64_t> pin(SigBit bit) { return literal(index.sigmap(bit)); }
 
 	std::optional<uint64_t> decode(SigBit bit, int depth = 12)
 	{
 		bit = index.sigmap(bit);
+		if (dependencies && bit.wire)
+			dependencies->insert(bit);
 		if (slots.count(bit))
 			return literal(bit);
 		auto found = decoded.find(bit);

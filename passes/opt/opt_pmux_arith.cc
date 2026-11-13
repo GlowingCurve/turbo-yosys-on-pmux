@@ -377,7 +377,7 @@ bool prepare_arithmetic_rewrite(PmuxRewrite &candidate, PmuxCoarseIndex &index, 
 	record_inputs(result);
 	for (auto bit : index.port(root, ID::Y))
 		outputs.insert(bit);
-	candidate.removed = index.removable(region, {}, outputs, inputs);
+	candidate.find_removable(region, {}, outputs, inputs);
 	if (!candidate.removed.count(root))
 		return false;
 	candidate.connect(root->getPort(ID::Y), result);
@@ -996,8 +996,14 @@ int rewrite_excluded_terms(PmuxCoarseIndex &index, bool external_inputs)
 
 int rewrite_common_columns(PmuxCoarseIndex &index, bool external_inputs)
 {
-	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type.in(ID($mux), ID($pmux)); });
-	auto operators = selected_roots(index.module, [](Cell *cell) { return arithmetic_type(cell->type); });
+	std::vector<IdString> names, operators;
+	for (Cell *cell : index.module->cells()) {
+		bool selection = cell->type.in(ID($mux), ID($pmux));
+		if ((selection || arithmetic_type(cell->type)) && index.module->selected(cell))
+			(selection ? names : operators).push_back(cell->name);
+	}
+	std::sort(names.begin(), names.end());
+	std::sort(operators.begin(), operators.end());
 	names.insert(names.end(), operators.begin(), operators.end());
 	return rewrite_roots(index, names, [external_inputs](PmuxCoarseIndex &index, Cell *cell) {
 		return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::CommonColumns);

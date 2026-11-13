@@ -18,7 +18,7 @@ bool onehot(const Const &value)
 	return value.is_fully_def() && std::count(value.begin(), value.end(), State::S1) == 1;
 }
 
-std::optional<StateCode> comparison(PmuxCoarseIndex &index, Cell *cell)
+std::optional<StateCode> comparison(PmuxCoarseIndex &index, Cell *cell, pool<SigBit> *dependencies = nullptr)
 {
 	if (!cell || !cell->type.in(ID($eq), ID($ne), ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1)
 		return std::nullopt;
@@ -29,6 +29,12 @@ std::optional<StateCode> comparison(PmuxCoarseIndex &index, Cell *cell)
 	StateCode result;
 	for (int offset = 0; offset < GetSize(a); ++offset) {
 		SigBit bit = a[offset], value = b[offset];
+		if (dependencies) {
+			if (bit.wire)
+				dependencies->insert(bit);
+			if (value.wire)
+				dependencies->insert(value);
+		}
 		if (!bit.wire)
 			std::swap(bit, value);
 		if (value.wire || (value != State::S0 && value != State::S1))
@@ -63,12 +69,21 @@ class StateWorker
 	PmuxCoarseIndex index;
 	FfInitVals initvals;
 
-	std::optional<std::vector<bool>> state_only_branches(const SigSpec &select, const pool<SigBit> &state)
+	struct OnehotProof {
+		bool proven = false;
+		pool<SigBit> dependencies;
+	};
+	using OnehotProofs = dict<Cell *, OnehotProof>;
+
+	std::optional<std::vector<bool>> state_only_branches(const SigSpec &select, const pool<SigBit> &state,
+			pool<SigBit> &dependencies)
 	{
 		std::vector<bool> reachable(GetSize(select) + 1);
 		pool<SigBit> matched;
 		for (int i = 0; i < GetSize(select); ++i) {
 			SigBit bit = select[i];
+			if (bit.wire)
+				dependencies.insert(bit);
 			if (bit == State::S0)
 				continue;
 			StateCode condition;
@@ -77,7 +92,7 @@ class StateWorker
 				condition.emplace(bit, true);
 			} else if (bit != State::S1) {
 				auto cell = index.driver(bit);
-				auto code = comparison(index, cell);
+				auto code = comparison(index, cell, &dependencies);
 				if (!code || std::any_of(code->begin(), code->end(), [&](const auto &literal) { return !state.count(literal.first); }))
 					return std::nullopt;
 				condition = std::move(*code);
@@ -95,14 +110,15 @@ class StateWorker
 		return reachable;
 	}
 
-	std::optional<std::vector<bool>> reachable_branches(const SigSpec &select, const pool<SigBit> &state)
+	std::optional<std::vector<bool>> reachable_branches(const SigSpec &select, const pool<SigBit> &state,
+			pool<SigBit> &dependencies)
 	{
-		PmuxEncoding encoding(index);
+		PmuxEncoding encoding(index, &dependencies);
 		std::vector<uint64_t> conditions;
 		for (auto bit : select) {
 			auto truth = encoding.decode(bit);
 			if (!truth)
-				return state_only_branches(select, state);
+				return state_only_branches(select, state, dependencies);
 			conditions.push_back(*truth);
 		}
 		unsigned state_mask = 0;
@@ -130,12 +146,15 @@ class StateWorker
 	}
 
 	bool onehot_next(const SigSpec &value, const pool<SigBit> &bits, pool<Cell *> &active,
-			pool<SigSpec> &proven, int &budget, int depth)
+			pool<SigSpec> &proven, pool<SigBit> &dependencies, int &budget, int depth)
 	{
 		if (--budget < 0 || depth > 16 || GetSize(value) != GetSize(bits))
 			return false;
 		if (proven.count(value))
 			return true;
+		for (auto bit : value)
+			if (bit.wire)
+				dependencies.insert(bit);
 		if (value.is_fully_const())
 			return onehot(value.as_const());
 		if (pool<SigBit>(value.begin(), value.end()) == bits)
@@ -151,15 +170,15 @@ class StateWorker
 		if (GetSize(a) != width || select.empty() || GetSize(select) > 128 || GetSize(b) != width * GetSize(select))
 			return false;
 		if (mux->type == ID($mux)) {
-			if (GetSize(select) != 1 || !onehot_next(a, bits, active, proven, budget, depth + 1) ||
-					!onehot_next(b, bits, active, proven, budget, depth + 1))
+			if (GetSize(select) != 1 || !onehot_next(a, bits, active, proven, dependencies, budget, depth + 1) ||
+					!onehot_next(b, bits, active, proven, dependencies, budget, depth + 1))
 				return false;
 		} else {
-			auto reachable = reachable_branches(select, bits);
-			if (!reachable || ((*reachable)[0] && !onehot_next(a, bits, active, proven, budget, depth + 1)))
+			auto reachable = reachable_branches(select, bits, dependencies);
+			if (!reachable || ((*reachable)[0] && !onehot_next(a, bits, active, proven, dependencies, budget, depth + 1)))
 				return false;
 			for (int branch = 0; branch < GetSize(select); ++branch)
-				if ((*reachable)[branch + 1] && !onehot_next(b.extract(branch * width, width), bits, active, proven, budget, depth + 1))
+				if ((*reachable)[branch + 1] && !onehot_next(b.extract(branch * width, width), bits, active, proven, dependencies, budget, depth + 1))
 					return false;
 		}
 		active.erase(mux);
@@ -167,10 +186,13 @@ class StateWorker
 		return true;
 	}
 
-	bool onehot_register(Cell *state)
+	bool onehot_register(Cell *state, pool<SigBit> &dependencies)
 	{
 		FfData ff(&initvals, state);
 		SigSpec q = index.sigmap(ff.sig_q);
+		for (auto bit : q)
+			if (bit.wire)
+				dependencies.insert(bit);
 		if (!ff.has_clk || ff.has_aload || ff.has_sr || GetSize(q) < 2 || GetSize(q) > 128 || !onehot(ff.val_init) ||
 				(ff.has_arst && !onehot(ff.val_arst)) || (ff.has_srst && !onehot(ff.val_srst)))
 			return false;
@@ -183,10 +205,10 @@ class StateWorker
 		pool<Cell *> active;
 		pool<SigSpec> proven;
 		int budget = 128;
-		return onehot_next(index.sigmap(ff.sig_d), bits, active, proven, budget, 0);
+		return onehot_next(index.sigmap(ff.sig_d), bits, active, proven, dependencies, budget, 0);
 	}
 
-	bool replace_decode(Cell *cell, dict<Cell *, bool> &onehot_states)
+	bool replace_decode(Cell *cell, OnehotProofs &onehot_states)
 	{
 		if (!index.editable(cell) || !initvals(cell->getPort(ID::Y)).is_fully_undef())
 			return false;
@@ -198,10 +220,10 @@ class StateWorker
 				return index.driver(literal.first) != state;
 			}))
 			return false;
-		auto status = onehot_states.emplace(state, false);
-		if (status.second)
-			status.first->second = onehot_register(state);
-		if (!status.first->second)
+		auto [status, inserted] = onehot_states.emplace(state, OnehotProof{});
+		if (inserted)
+			status->second.proven = onehot_register(state, status->second.dependencies);
+		if (!status->second.proven)
 			return false;
 
 		SigSpec q = index.port(state, ID::Q);
@@ -223,11 +245,20 @@ class StateWorker
 		auto y = index.port(cell, ID::Y);
 		auto input = index.sigmap(replacement);
 		PmuxRewrite rewrite(module, index, "one-hot state decode");
-		rewrite.removed = index.removable({cell}, {}, pool<SigBit>(y.begin(), y.end()), {input});
+		rewrite.find_removable({cell}, {}, pool<SigBit>(y.begin(), y.end()), {input});
 		rewrite.connect(cell->getPort(ID::Y), input);
 		if (!rewrite.validate())
 			return false;
 		rewrite.commit();
+		// 旧输出的驱动已经改变。替代信号保留驱动，只有代表位变化才会影响证明。
+		bool input_changed = input.wire && index.sigmap(input) != input;
+		for (auto it = onehot_states.begin(); it != onehot_states.end(); ) {
+			const auto &dependencies = it->second.dependencies;
+			if (dependencies.count(y.as_bit()) || (input_changed && dependencies.count(input)))
+				it = onehot_states.erase(it);
+			else
+				++it;
+		}
 		return true;
 	}
 
@@ -437,7 +468,7 @@ class StateWorker
 			if (!index.independent(inputs, targets))
 				continue;
 			rewrite.staging.addDff(NEW_ID, clock, input, output, state_ff.pol_clk, mux->get_src_attribute());
-			rewrite.removed = index.removable(candidates, {}, targets, inputs);
+			rewrite.find_removable(candidates, {}, targets, inputs);
 			int removed_bits = 0;
 			for (auto cell : rewrite.removed)
 				if (clocked_ff(cell))
@@ -476,13 +507,12 @@ public:
 		for (auto cell : module->selected_cells())
 			if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
 				decodes.push_back(cell->name);
-		dict<Cell *, bool> onehot_states;
+		OnehotProofs onehot_states;
 		int removed = 0;
 		for (auto name : decodes) {
 			auto cell = module->cell(name);
 			if (!cell || !replace_decode(cell, onehot_states))
 				continue;
-			onehot_states.clear();
 			++removed;
 		}
 		return removed;

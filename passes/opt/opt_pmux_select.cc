@@ -32,7 +32,7 @@ class SelectWorker
 		for (auto bit : index.sigmap(output))
 			outputs.insert(bit);
 		candidates.insert(replaced.begin(), replaced.end());
-		rewrite.removed = index.removable(candidates, replaced, outputs, inputs);
+		rewrite.find_removable(candidates, replaced, outputs, inputs);
 		return std::all_of(replaced.begin(), replaced.end(), [&](auto cell) { return rewrite.removed.count(cell); });
 	}
 
@@ -74,12 +74,12 @@ class SelectWorker
 				}
 				roots.push_back(tree.column(std::move(rows), controls));
 			}
-			if (tree.mux_bits(roots) >= GetSize(output) * (GetSize(inner_select) + 1))
+			auto live = tree.analyze(roots);
+			if (live.mux_bits >= GetSize(output) * (GetSize(inner_select) + 1))
 				continue;
-
 			PmuxRewrite rewrite(module, index, "merge_select_wrapper");
-			rewrite.connect(output, tree.emit(&rewrite.staging, roots, outer->get_src_attribute()));
-			if (!collect_removable(rewrite, replaced, encoding.cells, output, tree.inputs(roots)) ||
+			rewrite.connect(output, tree.emit(&rewrite.staging, roots, outer->get_src_attribute(), live));
+			if (!collect_removable(rewrite, replaced, encoding.cells, output, tree.inputs(live)) ||
 					GetSize(rewrite.removed) <= rewrite.added_count() || !rewrite.validate())
 				continue;
 			rewrite.commit();
@@ -267,33 +267,33 @@ class SelectWorker
 		}
 		pool<Cell *> candidates = encoding.cells;
 		candidates.insert(tree.producers.begin(), tree.producers.end());
-		auto build_candidate = [&](const std::vector<int> &values, int mux_count, const char *rule) -> std::unique_ptr<PmuxRewrite> {
-			if (all_single && mux_count >= GetSize(output))
+		auto build_candidate = [&](const std::vector<int> &values, const PmuxSelectTree::Analysis &live, const char *rule) -> std::unique_ptr<PmuxRewrite> {
+			if (all_single && live.mux_bits >= GetSize(output))
 				return nullptr;
 			auto rewrite = std::make_unique<PmuxRewrite>(module, index, rule);
-			if (!collect_removable(*rewrite, replaced, candidates, output, tree.inputs(values)))
+			if (!collect_removable(*rewrite, replaced, candidates, output, tree.inputs(live)))
 				return nullptr;
 			if (!all_single && !direct_column && std::all_of(rewrite->removed.begin(), rewrite->removed.end(),
 					[&](auto cell) { return replaced.count(cell); }))
 				return nullptr;
-			rewrite->connect(output, tree.emit(&rewrite->staging, values, networks.front().cell->get_src_attribute()));
+			rewrite->connect(output, tree.emit(&rewrite->staging, values, networks.front().cell->get_src_attribute(), live));
 			if (!rewrite->validate())
 				return nullptr;
 			return rewrite;
 		};
-		int mux_count = tree.mux_bits(roots);
-		auto forward = build_candidate(roots, mux_count, specialize ? "specialize_decoded_data" : "rebuild_decode");
+		auto live = tree.analyze(roots);
+		auto forward = build_candidate(roots, live, specialize ? "specialize_decoded_data" : "rebuild_decode");
 		if (reversed_roots.empty() || reversed_roots == roots)
 			return forward;
-		int reversed_mux_count = tree.mux_bits(reversed_roots);
-		if (forward && reversed_mux_count > mux_count)
+		auto reversed_live = tree.analyze(reversed_roots);
+		if (forward && reversed_live.mux_bits > live.mux_bits)
 			return forward;
-		auto reverse = build_candidate(reversed_roots, reversed_mux_count,
+		auto reverse = build_candidate(reversed_roots, reversed_live,
 				specialize ? "specialize_decoded_data_reverse" : "rebuild_decode_reverse");
 		auto rank = [](const PmuxRewrite &rewrite, int count) {
 			return std::pair{count, rewrite.added_count() - GetSize(rewrite.removed)};
 		};
-		if (reverse && (!forward || rank(*reverse, reversed_mux_count) < rank(*forward, mux_count)))
+		if (reverse && (!forward || rank(*reverse, reversed_live.mux_bits) < rank(*forward, live.mux_bits)))
 			return reverse;
 		return forward;
 	}
@@ -319,7 +319,6 @@ class SelectWorker
 			foldable.emplace(cell, std::array{!choices.empty(), !choices.empty()});
 		if (choices.empty())
 			return foldable;
-
 		const auto partial_codes = encoding.partial_codes();
 		for (int row = 0; row < GetSize(partial_codes); ++row) {
 			const auto &partial = partial_codes[row];
@@ -407,8 +406,9 @@ class SelectWorker
 		}
 		if (plans.empty())
 			return nullptr;
+		auto live = tree.analyze(roots);
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "specialize_shared_decode");
-		SigSpec data = tree.emit(&rewrite->staging, roots, networks.front().cell->get_src_attribute());
+		SigSpec data = tree.emit(&rewrite->staging, roots, networks.front().cell->get_src_attribute(), live);
 		for (const auto &plan : plans) {
 			auto select = index.port(plan.cell, ID::S);
 			int branch_data = plan.width * GetSize(select);
@@ -424,7 +424,7 @@ class SelectWorker
 			if (!plan.direct_output.empty())
 				rewrite->connect(plan.direct_output, data.extract(plan.first + plan.width + branch_data, GetSize(plan.direct_output)));
 		}
-		auto inputs = tree.inputs(roots);
+		auto inputs = tree.inputs(live);
 		inputs.insert(select_inputs.begin(), select_inputs.end());
 		pool<Cell *> candidates = encoding.cells;
 		candidates.insert(tree.producers.begin(), tree.producers.end());
@@ -433,14 +433,23 @@ class SelectWorker
 		return rewrite;
 	}
 
-	std::unique_ptr<PmuxRewrite> specialize_data(const std::vector<SelectNetwork> &networks,
-			const PmuxEncoding &encoding, bool shared_decode)
+	struct GroupAnalysis {
+		PmuxEncoding encoding;
+		std::vector<SelectNetwork> networks;
+		std::optional<bool> shared_decode;
+
+		explicit GroupAnalysis(const PmuxCoarseIndex &index) : encoding(index) {}
+	};
+
+	std::unique_ptr<PmuxRewrite> specialize_data(GroupAnalysis &group, bool shared_decode)
 	{
-		pool<Cell *> selections;
-		for (const auto &network : networks)
-			selections.insert(network.cell);
-		bool shared = index.removable(encoding.cells, selections, {}, {}) != encoding.cells;
-		return shared == shared_decode ? keep_decode(networks, encoding) : nullptr;
+		if (!group.shared_decode) {
+			pool<Cell *> selections;
+			for (const auto &network : group.networks)
+				selections.insert(network.cell);
+			group.shared_decode = index.removable(group.encoding.cells, selections, {}, {}) != group.encoding.cells;
+		}
+		return *group.shared_decode == shared_decode ? keep_decode(group.networks, group.encoding) : nullptr;
 	}
 
 	std::vector<Cell *> selected_cells(bool pmux_only) const
@@ -452,10 +461,8 @@ class SelectWorker
 		return cells;
 	}
 
-	template<typename Build>
-	bool rewrite_group(std::vector<IdString> &names, bool pmux_only, bool retain_choices, Build build)
+	bool analyze_group(const std::vector<IdString> &names, bool pmux_only, GroupAnalysis &group)
 	{
-		std::vector<SelectNetwork> networks;
 		std::vector<SigSpec> selectors;
 		int width = 0;
 		for (auto name : names) {
@@ -465,28 +472,28 @@ class SelectWorker
 			auto y = index.port(cell, ID::Y);
 			width += GetSize(y);
 			selectors.push_back(index.port(cell, ID::S));
-			networks.push_back({cell, index.port(cell, ID::A), index.port(cell, ID::B), y, {}});
+			group.networks.push_back({cell, index.port(cell, ID::A), index.port(cell, ID::B), y, {}});
 		}
-		if (networks.empty())
+		if (group.networks.empty())
 			return false;
-		PmuxEncoding encoding(index);
 		std::vector<std::vector<int>> tables;
-		if (!encoding.branch_tables(selectors, tables) || width > pmux_max_table_bits / GetSize(tables.front()))
+		if (!group.encoding.branch_tables(selectors, tables) || width > pmux_max_table_bits / GetSize(tables.front()))
 			return false;
-		for (int i = 0; i < GetSize(networks); ++i)
-			networks[i].branches = std::move(tables[i]);
-		auto rewrite = build(networks, encoding);
-		if (!rewrite)
-			return false;
+		for (int i = 0; i < GetSize(group.networks); ++i)
+			group.networks[i].branches = std::move(tables[i]);
+		return true;
+	}
+
+	void commit_group(PmuxRewrite &rewrite, std::vector<IdString> &names, bool pmux_only, bool retain_choices)
+	{
 		if (retain_choices)
-			for (auto cell : rewrite->staging.cells())
+			for (auto cell : rewrite.staging.cells())
 				if (cell->type == ID($pmux) || (!pmux_only && cell->type == ID($mux)))
 					names.push_back(cell->name);
-		rewrite->commit();
+		rewrite.commit();
 		std::erase_if(names, [&](IdString name) { return !module->cell(name); });
 		std::sort(names.begin(), names.end());
 		names.erase(std::unique(names.begin(), names.end()), names.end());
-		return true;
 	}
 
 	int merge_wrappers()
@@ -519,20 +526,36 @@ class SelectWorker
 	int rewrite_network(std::vector<IdString> names, bool pmux_only)
 	{
 		int rewrites = 0;
-		rewrites += rewrite_group(names, pmux_only, true, [&](const auto &networks, const auto &encoding) {
-			return reduce_fields(networks, encoding);
+		std::optional<GroupAnalysis> group;
+		auto apply = [&](bool retain_choices, auto build) {
+			if (!group) {
+				group.emplace(index);
+				if (!analyze_group(names, pmux_only, *group))
+					group->networks.clear();
+			}
+			if (group->networks.empty())
+				return;
+			auto rewrite = build(*group);
+			if (!rewrite)
+				return;
+			commit_group(*rewrite, names, pmux_only, retain_choices);
+			group.reset();
+			++rewrites;
+		};
+		apply(true, [&](const auto &group) {
+			return reduce_fields(group.networks, group.encoding);
 		});
-		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
-			return specialize_data(networks, encoding, true);
+		apply(false, [&](auto &group) {
+			return specialize_data(group, true);
 		});
-		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
-			return rebuild(networks, encoding, true);
+		apply(false, [&](const auto &group) {
+			return rebuild(group.networks, group.encoding, true);
 		});
-		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
-			return rebuild(networks, encoding, false);
+		apply(false, [&](const auto &group) {
+			return rebuild(group.networks, group.encoding, false);
 		});
-		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
-			return specialize_data(networks, encoding, false);
+		apply(false, [&](auto &group) {
+			return specialize_data(group, false);
 		});
 		return rewrites;
 	}

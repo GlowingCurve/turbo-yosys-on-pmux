@@ -183,6 +183,16 @@ struct SynthIntelPass : public ScriptPass {
 		log_pop();
 	}
 
+	bool has_lut_comparison() const
+	{
+		for (auto module : active_design->selected_unboxed_modules())
+			for (auto cell : module->cells())
+				if (cell->type.in(ID($lt), ID($le), ID($gt), ID($ge)) && active_design->selected(module, cell) &&
+				    GetSize(cell->getPort(ID::A)) <= 4 && GetSize(cell->getPort(ID::B)) <= 4 && GetSize(cell->getPort(ID::Y)) == 1)
+					return true;
+		return false;
+	}
+
 	void script() override
 	{
 		if (check_label("begin")) {
@@ -219,7 +229,8 @@ struct SynthIntelPass : public ScriptPass {
 			// Coalesce equivalent branches before rebuilding selection trees.
 			run("opt_reduce");
 			run("opt_pmux_select");
-			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4");
+			if (help_mode || has_lut_comparison())
+				run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4", "(if a comparison fits the LUT width)");
 			run("opt_expr");
 			run("opt_clean");
 
@@ -270,7 +281,7 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a,-F,6,-A,8" + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a,-F,4,-A,4" + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt_pmuxprep -fast");
 			run("autoname");

@@ -20,10 +20,19 @@ inline bool pmux_coarse_observes_undef(Design *design)
 
 class PmuxCoarseIndex
 {
+	friend class PmuxRewrite;
+
 	struct Index : ModIndex {
 		bool aliases_changed = true;
+		size_t revision = 0;
 
 		explicit Index(Module *module) : ModIndex(module) {}
+
+		void notify_connect(Cell *cell, IdString port, const SigSpec &old_sig, const SigSpec &sig) override
+		{
+			ModIndex::notify_connect(cell, port, old_sig, sig);
+			++revision;
+		}
 
 		void notify_connect(Module *module, const RTLIL::SigSig &connection) override
 		{
@@ -32,18 +41,21 @@ class PmuxCoarseIndex
 			else
 				ModIndex::notify_connect(module, connection);
 			aliases_changed = true;
+			++revision;
 		}
 
 		void notify_connect(Module *module, const std::vector<RTLIL::SigSig> &connections) override
 		{
 			ModIndex::notify_connect(module, connections);
 			aliases_changed = true;
+			++revision;
 		}
 
 		void notify_blackout(Module *module) override
 		{
 			ModIndex::notify_blackout(module);
 			aliases_changed = true;
+			++revision;
 		}
 	};
 
@@ -183,23 +195,7 @@ public:
 	pool<Cell *> removable(const pool<Cell *> &candidates, const pool<Cell *> &replaced_users,
 			const pool<SigBit> &replaced_outputs, const pool<SigBit> &retained_inputs) const
 	{
-		pool<SigBit> replaced, retained;
-		for (auto bit : replaced_outputs)
-			replaced.insert(sigmap(bit));
-		for (auto bit : retained_inputs)
-			retained.insert(sigmap(bit));
-
-		pool<Cell *> result = candidates;
-		std::vector<Cell *> blocked;
-		do {
-			blocked.clear();
-			for (auto cell : result)
-				if (!can_remove(cell, result, replaced_users, replaced, retained))
-					blocked.push_back(cell);
-			for (auto cell : blocked)
-				result.erase(cell);
-		} while (!blocked.empty());
-		return result;
+		return removable_normalized(candidates, replaced_users, normalize_bits(replaced_outputs), normalize_bits(retained_inputs));
 	}
 
 	bool independent(const pool<SigBit> &inputs, const pool<SigBit> &outputs) const
@@ -218,6 +214,64 @@ public:
 	}
 
 private:
+	pool<SigBit> normalize_bits(const pool<SigBit> &bits) const
+	{
+		pool<SigBit> normalized;
+		for (auto bit : bits)
+			normalized.insert(sigmap(bit));
+		return normalized;
+	}
+
+	pool<Cell *> removable_normalized(const pool<Cell *> &candidates, const pool<Cell *> &replaced_users,
+			const pool<SigBit> &replaced, const pool<SigBit> &retained) const
+	{
+		pool<Cell *> result = candidates;
+		std::vector<Cell *> blocked;
+		for (auto cell : result)
+			if (!can_remove(cell, result, replaced_users, replaced, retained))
+				blocked.push_back(cell);
+
+		pool<SigBit> checked_inputs;
+		pool<Cell *> next;
+		while (!blocked.empty()) {
+			for (auto cell : blocked)
+				result.erase(cell);
+			if (result.empty())
+				break;
+			for (auto cell : blocked) {
+				if (replaced_users.count(cell))
+					continue;
+				for (const auto &[port, signal] : cell->connections()) {
+					// 非输入端口会使该信号失去唯一驱动，无法阻止可删除的生产者。
+					if (cell->port_dir(port) != RTLIL::PD_INPUT)
+						continue;
+					for (auto bit : signal) {
+						bit = sigmap(bit);
+						if (!bit.wire || replaced.count(bit) || !checked_inputs.insert(bit).second)
+							continue;
+						if (auto producer = driver(bit); producer && result.count(producer))
+							next.insert(producer);
+					}
+				}
+			}
+			blocked.assign(next.begin(), next.end());
+			next.clear();
+			// pool 删除元素时会移动尾部元素，按当前遍历顺序处理每轮删除。
+			const auto &ordered = result;
+			std::sort(blocked.begin(), blocked.end(), [&](Cell *left, Cell *right) {
+				return left != right && ordered.count(right, ordered.find(left));
+			});
+		}
+		return result;
+	}
+
+	bool all_removable(const pool<Cell *> &cells, const pool<SigBit> &outputs, const pool<SigBit> &inputs) const
+	{
+		return std::all_of(cells.begin(), cells.end(), [&](auto cell) {
+			return can_remove(cell, cells, {}, outputs, inputs);
+		});
+	}
+
 	bool can_remove(Cell *cell, const pool<Cell *> &candidates, const pool<Cell *> &replaced_users,
 			const pool<SigBit> &replaced_outputs, const pool<SigBit> &retained_inputs) const
 	{

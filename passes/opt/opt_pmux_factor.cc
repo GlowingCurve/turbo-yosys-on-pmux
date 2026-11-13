@@ -22,17 +22,23 @@ struct FactorChoice
 	SigSpec select;
 	std::vector<SigSpec> branches;
 
-	static std::optional<FactorChoice> read(PmuxCoarseIndex &index, Cell *cell)
+	static bool valid(Cell *cell)
 	{
 		if (!cell->type.in(ID($mux), ID($pmux)))
+			return false;
+		int selects = GetSize(cell->getPort(ID::S)), width = GetSize(cell->getPort(ID::Y));
+		return selects > 0 && (cell->type == ID($pmux) || selects == 1) &&
+				GetSize(cell->getPort(ID::A)) == width && GetSize(cell->getPort(ID::B)) == width * selects;
+	}
+
+	static std::optional<FactorChoice> read(PmuxCoarseIndex &index, Cell *cell)
+	{
+		if (!valid(cell))
 			return std::nullopt;
 		SigSpec select = index.port(cell, ID::S);
 		SigSpec a = index.port(cell, ID::A);
 		SigSpec b = index.port(cell, ID::B);
-		int width = GetSize(index.port(cell, ID::Y));
-		if (select.empty() || (cell->type == ID($mux) && GetSize(select) != 1) ||
-				GetSize(a) != width || GetSize(b) != width * GetSize(select))
-			return std::nullopt;
+		int width = GetSize(a);
 		FactorChoice choice{select, {a}};
 		for (int i = 0; i < GetSize(select); i++)
 			choice.branches.push_back(b.extract(i * width, width));
@@ -111,7 +117,7 @@ bool prepare_factor(PmuxCoarseIndex &index, const pool<Cell *> &roots, const poo
 				retain(signal);
 	for (const auto &connection : rewrite.staging.connections())
 		retain(connection.second);
-	rewrite.removed = index.removable(region, {}, output_bits, input_bits);
+	rewrite.find_removable(region, {}, output_bits, input_bits);
 	return std::all_of(roots.begin(), roots.end(), [&](auto root) { return rewrite.removed.count(root); });
 }
 
@@ -200,11 +206,9 @@ struct ChoiceColumns
 	std::vector<Column> columns;
 	std::vector<dict<SigBit, std::vector<int>>> by_branch;
 	dict<SigSpec, std::vector<int>> exact, without_default;
-	int cells = 0;
 
 	void add(PmuxCoarseIndex &index, Cell *cell, const FactorChoice &choice)
 	{
-		++cells;
 		by_branch.resize(choice.branches.size());
 		auto output = index.port(cell, ID::Y);
 		for (int offset = 0; offset < GetSize(output); ++offset) {
@@ -458,14 +462,16 @@ struct JointChoiceFields
 	std::map<IdString, FactorField> reusable, single_operand;
 };
 
-JointChoiceFields collect_joint_fields(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice, const ChoiceColumns &available)
+JointChoiceFields collect_joint_fields(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice, const ChoiceColumns *available)
 {
 	JointChoiceFields fields;
-	SigSpec output = index.port(root, ID::Y);
-	pool<SigBit> outputs(output.begin(), output.end());
+	pool<SigBit> outputs;
+	if (available)
+		for (auto bit : index.port(root, ID::Y))
+			outputs.insert(bit);
 	match_choice_fields(index, choice, [&](int offset, const auto &bits) {
-		if (available.cells > 1)
-			match_reusable_field(index, root, outputs, offset, bits, available, fields.reusable, fields.single_operand);
+		if (available)
+			match_reusable_field(index, root, outputs, offset, bits, *available, fields.reusable, fields.single_operand);
 		match_nested_fields(offset, bits, fields.nested);
 		match_bitwise_fields(offset, bits, fields.bitwise);
 	});
@@ -611,18 +617,43 @@ int factor_local_choices(PmuxCoarseIndex &index)
 	return rewrites;
 }
 
+using SelectKey = std::pair<IdString, SigSpec>;
+
+dict<SelectKey, ChoiceColumns> reusable_columns(PmuxCoarseIndex &index, const std::vector<IdString> &choices)
+{
+	dict<SelectKey, std::vector<Cell *>> groups;
+	for (auto name : choices) {
+		auto cell = index.module->cell(name);
+		if (FactorChoice::valid(cell) && index.editable(cell))
+			groups[{cell->type, index.port(cell, ID::S)}];
+	}
+	if (groups.empty())
+		return {};
+	for (auto cell : index.module->cells()) {
+		if (!FactorChoice::valid(cell))
+			continue;
+		if (auto group = groups.find({cell->type, index.port(cell, ID::S)}); group != groups.end())
+			group->second.push_back(cell);
+	}
+
+	dict<SelectKey, ChoiceColumns> available;
+	for (auto &[key, members] : groups) {
+		if (GetSize(members) < 2)
+			continue;
+		std::sort(members.begin(), members.end(), [](auto a, auto b) { return a->name < b->name; });
+		auto &columns = available[key];
+		for (auto cell : members)
+			columns.add(index, cell, *FactorChoice::read(index, cell));
+	}
+	return available;
+}
+
 int factor_joint_choices(PmuxCoarseIndex &index)
 {
 	auto choices = selected_choices(index.module);
 	if (choices.empty())
 		return 0;
-	using SelectKey = std::pair<IdString, SigSpec>;
-	dict<SelectKey, ChoiceColumns> available;
-	auto cells = index.module->cells().to_vector();
-	std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
-	for (auto cell : cells)
-		if (auto choice = FactorChoice::read(index, cell))
-			available[{cell->type, choice->select}].add(index, cell, *choice);
+	auto available = reusable_columns(index, choices);
 
 	struct Candidate {
 		Cell *root;
@@ -640,8 +671,8 @@ int factor_joint_choices(PmuxCoarseIndex &index)
 		auto choice = FactorChoice::read(index, root);
 		if (!choice)
 			continue;
-		const auto &columns = available.at({root->type, choice->select});
-		auto fields = collect_joint_fields(index, root, *choice, columns);
+		auto columns = available.find({root->type, choice->select});
+		auto fields = collect_joint_fields(index, root, *choice, columns == available.end() ? nullptr : &columns->second);
 		Candidate candidate{root, std::move(*choice), {}, {}, {root}, 0};
 		pool<int> occupied;
 		auto append = [&](auto &group) {

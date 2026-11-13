@@ -11,6 +11,13 @@ class PmuxRewrite
 	const PmuxCoarseIndex &index;
 	const char *rule;
 	bool validated = false;
+	pool<Cell *> removed_cells;
+
+	struct RemovalBoundary {
+		pool<SigBit> outputs, inputs;
+		size_t revision;
+	};
+	std::optional<RemovalBoundary> removal_boundary;
 
 	SigBit canonical(SigBit bit) const
 	{
@@ -60,7 +67,7 @@ class PmuxRewrite
 		return true;
 	}
 
-	bool check_removal(const std::vector<Cell *> &added) const
+	bool check_removal()
 	{
 		pool<SigBit> outputs, retained;
 		dict<SigBit, CandidateDriver> drivers;
@@ -83,7 +90,7 @@ class PmuxRewrite
 			if (bit.wire && bit.wire->module == module && !outputs.count(bit))
 				retained.insert(bit);
 		};
-		for (auto cell : added)
+		for (auto cell : staging.cells())
 			for (const auto &[name, signal] : cell->connections()) {
 				auto direction = cell->port_dir(name);
 				if (direction == RTLIL::PD_INPUT)
@@ -98,7 +105,7 @@ class PmuxRewrite
 			for (int i = 0; i < GetSize(lhs); ++i)
 				if (!add_driver(lhs[i], {nullptr, rhs[i]}))
 					return false;
-		for (auto cell : added)
+		for (auto cell : staging.cells())
 			for (const auto &[name, signal] : cell->connections())
 				if (cell->port_dir(name) == RTLIL::PD_INPUT)
 					for (auto bit : signal)
@@ -107,7 +114,9 @@ class PmuxRewrite
 			for (auto bit : connection.second)
 				retain(bit);
 
-		if (index.removable(removed, {}, outputs, retained) != removed)
+		bool checked_removal = removal_boundary && removal_boundary->revision == index.index.revision &&
+				removal_boundary->outputs == outputs && removal_boundary->inputs == retained;
+		if (!checked_removal && !index.all_removable(removed, outputs, retained))
 			return false;
 		pool<SigBit> inputs, active, checked;
 		pool<Cell *> checked_cells, active_cells;
@@ -119,9 +128,23 @@ class PmuxRewrite
 
 public:
 	Module staging;
-	pool<Cell *> removed;
+	const pool<Cell *> &removed = removed_cells;
 
 	PmuxRewrite(Module *module, const PmuxCoarseIndex &index, const char *rule) : module(module), index(index), rule(rule) {}
+	PmuxRewrite(const PmuxRewrite &) = delete;
+	PmuxRewrite &operator=(const PmuxRewrite &) = delete;
+
+	void find_removable(const pool<Cell *> &candidates, const pool<Cell *> &replaced_users,
+			const pool<SigBit> &outputs, const pool<SigBit> &inputs)
+	{
+		log_assert(!validated);
+		RemovalBoundary boundary{index.normalize_bits(outputs), index.normalize_bits(inputs), index.index.revision};
+		removed_cells = index.removable_normalized(candidates, replaced_users, boundary.outputs, boundary.inputs);
+		removal_boundary.reset();
+		// 只有已删除的使用者才可在最终验证时忽略。
+		if (std::all_of(replaced_users.begin(), replaced_users.end(), [&](auto cell) { return removed.count(cell); }))
+			removal_boundary.emplace(std::move(boundary));
+	}
 
 	void connect(const SigSpec &lhs, const SigSpec &rhs) { staging.connect(lhs, rhs); }
 	int added_count() const { return staging.cells_size(); }
@@ -129,7 +152,8 @@ public:
 	bool validate()
 	{
 		log_assert(!validated);
-		validated = check_removal(staging.cells().to_vector());
+		validated = check_removal();
+		removal_boundary.reset();
 		return validated;
 	}
 
