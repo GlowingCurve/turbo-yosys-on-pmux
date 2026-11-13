@@ -714,6 +714,25 @@ struct ContextRewrite
 	}
 };
 
+int specialize_branches(Module *module)
+{
+	std::vector<IdString> selections;
+	for (auto cell : module->selected_cells())
+		if (is_selection(cell))
+			selections.push_back(cell->name);
+	if (selections.empty())
+		return 0;
+
+	PmuxCoarseIndex index(module);
+	int changes = 0;
+	for (auto name : selections) {
+		auto cell = module->cell(name);
+		if (cell && is_selection(cell) && index.editable(cell))
+			changes += ContextRewrite(index, cell).run();
+	}
+	return changes;
+}
+
 struct OptPmuxContextPass : public Pass
 {
 	OptPmuxContextPass() : Pass("opt_pmux_context", "simplify RTLIL data logic under mux branch conditions") {}
@@ -738,19 +757,7 @@ struct OptPmuxContextPass : public Pass
 		for (auto module : design->selected_modules()) {
 			if (!module->processes.empty())
 				continue;
-			std::vector<IdString> selections;
-			for (auto cell : module->selected_cells())
-				if (is_selection(cell))
-					selections.push_back(cell->name);
-			if (selections.empty())
-				continue;
-			PmuxCoarseIndex index(module);
-			int changes = 0;
-			for (auto name : selections) {
-				auto cell = module->cell(name);
-				if (cell && index.editable(cell))
-					changes += ContextRewrite(index, cell).run();
-			}
+			int changes = specialize_branches(module);
 			if (changes)
 				log("Specialized %d selections in %s.\n", changes, log_id(module));
 		}

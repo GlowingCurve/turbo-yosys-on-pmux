@@ -573,7 +573,7 @@ class RelationWorker
 	{
 		std::vector<Cell *> result;
 		for (auto name : names)
-			if (auto cell = module->cell(name); cell && index.editable(cell))
+			if (auto cell = module->cell(name); cell && pmux_select_shape(cell) && index.editable(cell))
 				result.push_back(cell);
 		return result;
 	}
@@ -588,20 +588,20 @@ class RelationWorker
 		return cells;
 	}
 
-	bool rewrite_encoded(const std::vector<IdString> &names)
+	dict<SigSpec, std::vector<IdString>> encoded_groups()
 	{
-		auto cells = live_cells(names);
-		if (cells.empty())
-			return false;
-		std::vector<SigSpec> selects;
-		for (auto cell : cells)
-			selects.push_back(index.port(cell, ID::S));
-		PmuxEncoding encoding(index);
-		std::vector<std::vector<int>> tables;
-		if (!encoding.branch_tables(selects, tables))
-			return false;
-		if (apply(relations(cells, &encoding, tables)))
-			return true;
+		dict<SigSpec, std::vector<IdString>> groups;
+		for (auto cell : selected_choices()) {
+			PmuxEncoding encoding(index);
+			std::vector<int> rows;
+			if (encoding.branch_table(index.port(cell, ID::S), rows))
+				groups[pmux_control_key(encoding)].push_back(cell->name);
+		}
+		return groups;
+	}
+
+	bool rewrite_swap(const std::vector<Cell *> &cells, const PmuxEncoding &encoding, const std::vector<std::vector<int>> &tables)
+	{
 		PmuxSelectTree tree(index, encoding);
 		std::vector<SwapColumn> columns;
 		int rows = GetSize(tables.front());
@@ -626,14 +626,14 @@ class RelationWorker
 				return true;
 		if (GetSize(encoding.controls) < 3)
 			return false;
-	SwapPartialCodes partial{encoding, {cells.begin(), cells.begin() + columns.back().cell + 1}, encoding.partial_codes(), std::nullopt};
+		SwapPartialCodes partial{encoding, {cells.begin(), cells.begin() + columns.back().cell + 1}, encoding.partial_codes(), std::nullopt};
 		PmuxSelectTree raw_tree(index, encoding);
 		for (auto &column : columns) {
 			auto cell = cells[column.cell];
-		const auto &a = cell->getPort(ID::A), &b = cell->getPort(ID::B);
-		column.branch_values.push_back(raw_tree.literal(index.sigmap(a[column.offset])));
+			const auto &a = cell->getPort(ID::A), &b = cell->getPort(ID::B);
+			column.branch_values.push_back(raw_tree.literal(index.sigmap(a[column.offset])));
 			for (int offset = column.offset; offset < GetSize(b); offset += GetSize(a))
-			column.branch_values.push_back(raw_tree.literal(index.sigmap(b[offset])));
+				column.branch_values.push_back(raw_tree.literal(index.sigmap(b[offset])));
 			for (int row = 0; row < rows; ++row)
 				column.values[row] = column.branch_values[tables[column.cell][row] + 1];
 		}
@@ -643,10 +643,21 @@ class RelationWorker
 		return false;
 	}
 
-public:
-	explicit RelationWorker(Module *module) : module(module), index(module) {}
+	template<typename Rewrite>
+	bool rewrite_encoded_group(const std::vector<IdString> &names, Rewrite rewrite)
+	{
+		auto cells = live_cells(names);
+		if (cells.empty())
+			return false;
+		std::vector<SigSpec> selects;
+		for (auto cell : cells)
+			selects.push_back(index.port(cell, ID::S));
+		PmuxEncoding encoding(index);
+		std::vector<std::vector<int>> tables;
+		return encoding.branch_tables(selects, tables) && rewrite(cells, encoding, tables);
+	}
 
-	void run()
+	int share_exact_relations()
 	{
 		dict<std::pair<IdString, SigSpec>, std::vector<IdString>> exact;
 		for (auto cell : selected_choices()) {
@@ -654,24 +665,48 @@ public:
 			if (GetSize(select) <= 32)
 				exact[{cell->type, select}].push_back(cell->name);
 		}
-		bool changed = false;
-		int before = module->cells_size();
+		int changes = 0;
 		for (const auto &[key, names] : exact) {
 			auto matching = live_cells(names);
 			auto control = index.sigmap(key.second);
 			matching.erase(std::remove_if(matching.begin(), matching.end(), [&](auto cell) { return index.port(cell, ID::S) != control; }), matching.end());
-			changed |= apply(relations(matching));
+			changes += apply(relations(matching));
 		}
-		dict<SigSpec, std::vector<IdString>> encoded;
-		for (auto cell : selected_choices()) {
-			PmuxEncoding encoding(index);
-			std::vector<int> rows;
-			if (encoding.branch_table(index.port(cell, ID::S), rows))
-				encoded[pmux_control_key(encoding)].push_back(cell->name);
+		return changes;
+	}
+
+	bool share_encoded_relations(std::vector<IdString> &names)
+	{
+		return rewrite_encoded_group(names, [&](const auto &cells, const auto &encoding, const auto &tables) {
+			auto rewrite = relations(cells, &encoding, tables);
+			if (!rewrite)
+				return false;
+			for (auto cell : rewrite->staging.cells())
+				if (pmux_select_shape(cell))
+					names.push_back(cell->name);
+			return apply(std::move(rewrite));
+		});
+	}
+
+	bool share_output_swaps(const std::vector<IdString> &names)
+	{
+		return rewrite_encoded_group(names, [&](const auto &cells, const auto &encoding, const auto &tables) {
+			return rewrite_swap(cells, encoding, tables);
+		});
+	}
+
+public:
+	explicit RelationWorker(Module *module) : module(module), index(module) {}
+
+	void run()
+	{
+		int before = module->cells_size();
+		int changes = share_exact_relations();
+		for (auto &[key, names] : encoded_groups()) {
+			changes += share_encoded_relations(names);
+			changes += share_output_swaps(names);
 		}
-		for (const auto &[key, names] : encoded)
-			changed |= rewrite_encoded(names);
-		if (changed)
+		if (changes)
 			log("  %s: shared selection output relations, RTLIL cell delta %+d.\n", log_id(module), module->cells_size() - before);
 	}
 };

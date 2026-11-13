@@ -690,8 +690,15 @@ SigSpec emit_arithmetic(Module *module, const ArithmeticPlan &plan, const SigSpe
 	return result;
 }
 
-bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs)
+enum class ArithmeticTransform { ExcludedTerm, CommonColumns };
+
+bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs, ArithmeticTransform transform)
 {
+	if (!root->type.in(ID($mux), ID($pmux)) && !arithmetic_type(root->type))
+		return false;
+	if (transform == ArithmeticTransform::ExcludedTerm &&
+			(!root->type.in(ID($mux), ID($pmux)) || GetSize(root->getPort(ID::S)) < 2))
+		return false;
 	if (!index.editable(root))
 		return false;
 	SigSpec output = index.port(root, ID::Y);
@@ -763,10 +770,9 @@ bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs
 		candidate.commit();
 		return true;
 	};
-	if (GetSize(select) >= 2) {
+	if (transform == ArithmeticTransform::ExcludedTerm) {
 		ArithmeticPlan exclusion = make_exclusion_plan(expressions, defined, binary);
-		if (!exclusion.empty() && apply(exclusion, "arith-excluded-term"))
-			return true;
+		return !exclusion.empty() && apply(exclusion, "arith-excluded-term");
 	}
 	return apply(make_column_plan(expressions, defined), "arith-common-columns");
 }
@@ -945,6 +951,59 @@ bool rewrite_modulo(PmuxCoarseIndex &index, Cell *root)
 	return false;
 }
 
+template<typename Match>
+std::vector<IdString> selected_roots(Module *module, Match match)
+{
+	std::vector<IdString> names;
+	for (Cell *cell : module->selected_cells())
+		if (match(cell))
+			names.push_back(cell->name);
+	std::sort(names.begin(), names.end());
+	return names;
+}
+
+template<typename Rewrite>
+int rewrite_roots(PmuxCoarseIndex &index, const std::vector<IdString> &names, Rewrite rewrite)
+{
+	int changes = 0;
+	for (IdString name : names)
+		if (Cell *cell = index.module->cell(name))
+			changes += rewrite(index, cell);
+	return changes;
+}
+
+int rewrite_modulos(PmuxCoarseIndex &index)
+{
+	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type.in(ID($mod), ID($modfloor)); });
+	return rewrite_roots(index, names, rewrite_modulo);
+}
+
+int rewrite_extrema(PmuxCoarseIndex &index)
+{
+	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type == ID($pmux); });
+	return rewrite_roots(index, names, rewrite_extremum);
+}
+
+int rewrite_excluded_terms(PmuxCoarseIndex &index, bool external_inputs)
+{
+	auto names = selected_roots(index.module, [](Cell *cell) {
+		return cell->type.in(ID($mux), ID($pmux)) && GetSize(cell->getPort(ID::S)) >= 2;
+	});
+	return rewrite_roots(index, names, [external_inputs](PmuxCoarseIndex &index, Cell *cell) {
+		return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::ExcludedTerm);
+	});
+}
+
+int rewrite_common_columns(PmuxCoarseIndex &index, bool external_inputs)
+{
+	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type.in(ID($mux), ID($pmux)); });
+	auto operators = selected_roots(index.module, [](Cell *cell) { return arithmetic_type(cell->type); });
+	names.insert(names.end(), operators.begin(), operators.end());
+	return rewrite_roots(index, names, [external_inputs](PmuxCoarseIndex &index, Cell *cell) {
+		return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::CommonColumns);
+	});
+}
+
 struct OptPmuxArithPass : public Pass
 {
 	OptPmuxArithPass() : Pass("opt_pmux_arith", "simplify and share modular arithmetic around selections") {}
@@ -976,30 +1035,13 @@ struct OptPmuxArithPass : public Pass
 			if (module->has_processes_warn())
 				continue;
 			PmuxCoarseIndex index(module);
-			std::vector<IdString> modulos, selections, operators;
-			for (Cell *cell : module->selected_cells()) {
-				if (cell->type.in(ID($mod), ID($modfloor)))
-					modulos.push_back(cell->name);
-				else if (cell->type.in(ID($mux), ID($pmux)))
-					selections.push_back(cell->name);
-				else if (arithmetic_type(cell->type))
-					operators.push_back(cell->name);
-			}
-			std::sort(modulos.begin(), modulos.end());
-			std::sort(selections.begin(), selections.end());
-			std::sort(operators.begin(), operators.end());
-			for (IdString name : modulos) {
-				Cell *cell = module->cell(name);
-				if (cell && rewrite_modulo(index, cell))
-					design->scratchpad_set_bool("opt.did_something", true);
-			}
-			selections.insert(selections.end(), operators.begin(), operators.end());
 			bool external_inputs = !instantiated.count(module->name);
-			for (IdString name : selections) {
-				Cell *cell = module->cell(name);
-				if (cell && (rewrite_extremum(index, cell) || rewrite_arithmetic(index, cell, external_inputs)))
-					design->scratchpad_set_bool("opt.did_something", true);
-			}
+			int changes = rewrite_modulos(index);
+			changes += rewrite_extrema(index);
+			changes += rewrite_excluded_terms(index, external_inputs);
+			changes += rewrite_common_columns(index, external_inputs);
+			if (changes)
+				design->scratchpad_set_bool("opt.did_something", true);
 		}
 	}
 } OptPmuxArithPass;

@@ -433,14 +433,34 @@ class SelectWorker
 		return rewrite;
 	}
 
-	bool rewrite(const std::vector<IdString> &names)
+	std::unique_ptr<PmuxRewrite> specialize_data(const std::vector<SelectNetwork> &networks,
+			const PmuxEncoding &encoding, bool shared_decode)
+	{
+		pool<Cell *> selections;
+		for (const auto &network : networks)
+			selections.insert(network.cell);
+		bool shared = index.removable(encoding.cells, selections, {}, {}) != encoding.cells;
+		return shared == shared_decode ? keep_decode(networks, encoding) : nullptr;
+	}
+
+	std::vector<Cell *> selected_cells(bool pmux_only) const
+	{
+		auto cells = module->selected_cells();
+		if (pmux_only)
+			std::erase_if(cells, [](auto cell) { return cell->type != ID($pmux); });
+		std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
+		return cells;
+	}
+
+	template<typename Build>
+	bool rewrite_group(std::vector<IdString> &names, bool pmux_only, bool retain_choices, Build build)
 	{
 		std::vector<SelectNetwork> networks;
 		std::vector<SigSpec> selectors;
 		int width = 0;
 		for (auto name : names) {
 			auto cell = module->cell(name);
-			if (!cell || !index.editable(cell))
+			if (!cell || !pmux_select_shape(cell) || !index.editable(cell) || (pmux_only && cell->type != ID($pmux)))
 				continue;
 			auto y = index.port(cell, ID::Y);
 			width += GetSize(y);
@@ -455,49 +475,36 @@ class SelectWorker
 			return false;
 		for (int i = 0; i < GetSize(networks); ++i)
 			networks[i].branches = std::move(tables[i]);
-		pool<Cell *> selections;
-		for (const auto &network : networks)
-			selections.insert(network.cell);
-		bool shared_decode = index.removable(encoding.cells, selections, {}, {}) != encoding.cells;
-		auto commit = [](std::unique_ptr<PmuxRewrite> candidate) {
-			if (!candidate)
-				return false;
-			candidate->commit();
-			return true;
-		};
-		if (commit(reduce_fields(networks, encoding)))
-			return true;
-		if (shared_decode && commit(keep_decode(networks, encoding)))
-			return true;
-		if (commit(rebuild(networks, encoding, true)) || commit(rebuild(networks, encoding, false)))
-			return true;
-		return !shared_decode && commit(keep_decode(networks, encoding));
+		auto rewrite = build(networks, encoding);
+		if (!rewrite)
+			return false;
+		if (retain_choices)
+			for (auto cell : rewrite->staging.cells())
+				if (cell->type == ID($pmux) || (!pmux_only && cell->type == ID($mux)))
+					names.push_back(cell->name);
+		rewrite->commit();
+		std::erase_if(names, [&](IdString name) { return !module->cell(name); });
+		std::sort(names.begin(), names.end());
+		names.erase(std::unique(names.begin(), names.end()), names.end());
+		return true;
 	}
 
-public:
-	explicit SelectWorker(Module *module) : module(module), index(module) {}
+	int merge_wrappers()
+	{
+		std::vector<IdString> wrappers;
+		for (auto cell : selected_cells(false))
+			if (cell->type == ID($mux))
+				wrappers.push_back(cell->name);
+		int rewrites = 0;
+		for (auto name : wrappers)
+			if (auto cell = module->cell(name))
+				rewrites += merge_wrapper(cell);
+		return rewrites;
+	}
 
-	std::pair<int, int> run(bool pmux_only)
+	dict<SigSpec, std::vector<IdString>> group_networks(const std::vector<Cell *> &cells)
 	{
 		dict<SigSpec, std::vector<IdString>> groups;
-		std::vector<Cell *> cells = module->selected_cells();
-		if (pmux_only)
-			std::erase_if(cells, [](auto cell) { return cell->type != ID($pmux); });
-		std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
-		int rewrites = 0, before = module->cells_size();
-		if (!pmux_only) {
-			std::vector<IdString> wrappers;
-			for (auto cell : cells)
-				if (cell->type == ID($mux))
-					wrappers.push_back(cell->name);
-			for (auto name : wrappers)
-				if (auto cell = module->cell(name))
-					rewrites += merge_wrapper(cell);
-			if (rewrites) {
-				cells = module->selected_cells();
-				std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
-			}
-		}
 		for (auto cell : cells) {
 			if (!pmux_select_shape(cell) || !index.editable(cell))
 				continue;
@@ -506,11 +513,39 @@ public:
 			if (encoding.branch_table(index.port(cell, ID::S), branches))
 				groups[pmux_control_key(encoding)].push_back(cell->name);
 		}
+		return groups;
+	}
+
+	int rewrite_network(std::vector<IdString> names, bool pmux_only)
+	{
+		int rewrites = 0;
+		rewrites += rewrite_group(names, pmux_only, true, [&](const auto &networks, const auto &encoding) {
+			return reduce_fields(networks, encoding);
+		});
+		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
+			return specialize_data(networks, encoding, true);
+		});
+		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
+			return rebuild(networks, encoding, true);
+		});
+		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
+			return rebuild(networks, encoding, false);
+		});
+		rewrites += rewrite_group(names, pmux_only, false, [&](const auto &networks, const auto &encoding) {
+			return specialize_data(networks, encoding, false);
+		});
+		return rewrites;
+	}
+
+	int rewrite_networks(bool pmux_only)
+	{
+		int rewrites = 0;
 		auto apply = [&](const std::vector<IdString> &names) {
-			bool changed = rewrite(names);
-			rewrites += changed;
-			return changed;
+			int changes = rewrite_network(names, pmux_only);
+			rewrites += changes;
+			return changes != 0;
 		};
+		auto groups = group_networks(selected_cells(pmux_only));
 		for (const auto &[control, names] : groups) {
 			if (apply(names) || GetSize(names) == 1)
 				continue;
@@ -525,6 +560,17 @@ public:
 					apply({name});
 			}
 		}
+		return rewrites;
+	}
+
+public:
+	explicit SelectWorker(Module *module) : module(module), index(module) {}
+
+	std::pair<int, int> run(bool pmux_only)
+	{
+		int before = module->cells_size();
+		int rewrites = pmux_only ? 0 : merge_wrappers();
+		rewrites += rewrite_networks(pmux_only);
 		return {rewrites, module->cells_size() - before};
 	}
 };

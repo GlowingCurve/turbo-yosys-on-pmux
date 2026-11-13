@@ -186,60 +186,49 @@ class StateWorker
 		return onehot_next(index.sigmap(ff.sig_d), bits, active, proven, budget, 0);
 	}
 
-	void replace_decodes()
+	bool replace_decode(Cell *cell, dict<Cell *, bool> &onehot_states)
 	{
-		dict<Cell *, bool> onehot_states;
-		std::vector<std::pair<Cell *, SigBit>> replacements;
-		for (auto cell : module->selected_cells()) {
-			if (!cell->type.in(ID($eq), ID($ne), ID($logic_not)) || !index.editable(cell) ||
-					!initvals(cell->getPort(ID::Y)).is_fully_undef())
-				continue;
-			auto compare = comparison(index, cell);
-			if (!compare || compare->empty())
-				continue;
-			auto state = index.driver(compare->begin()->first);
-			if (!clocked_ff(state))
-				continue;
-			bool same_state = true;
-			for (const auto &[bit, high] : *compare)
-				same_state &= index.driver(bit) == state;
-			if (!same_state)
-				continue;
-			auto status = onehot_states.emplace(state, false);
-			if (status.second)
-				status.first->second = onehot_register(state);
-			if (!status.first->second)
-				continue;
-			SigSpec q = index.port(state, ID::Q);
-			int required_ones = high_literals(*compare);
-			SigBit replacement(State::S0);
-			int matches = 0;
-			for (auto bit : q) {
-				bool equal = matches_onehot(*compare, required_ones, bit);
-				if (equal != (cell->type == ID($ne))) {
-					matches++;
-					replacement = bit;
-				}
+		if (!index.editable(cell) || !initvals(cell->getPort(ID::Y)).is_fully_undef())
+			return false;
+		auto compare = comparison(index, cell);
+		if (!compare || compare->empty())
+			return false;
+		auto state = index.driver(compare->begin()->first);
+		if (!clocked_ff(state) || std::any_of(compare->begin(), compare->end(), [&](const auto &literal) {
+				return index.driver(literal.first) != state;
+			}))
+			return false;
+		auto status = onehot_states.emplace(state, false);
+		if (status.second)
+			status.first->second = onehot_register(state);
+		if (!status.first->second)
+			return false;
+
+		SigSpec q = index.port(state, ID::Q);
+		int required_ones = high_literals(*compare);
+		SigBit replacement(State::S0);
+		int matches = 0;
+		for (auto bit : q) {
+			bool equal = matches_onehot(*compare, required_ones, bit);
+			if (equal != (cell->type == ID($ne))) {
+				matches++;
+				replacement = bit;
 			}
-			if (matches == GetSize(q))
-				replacement = State::S1;
-			if (matches <= 1 || matches == GetSize(q))
-				replacements.emplace_back(cell, replacement);
 		}
-		int removed = 0;
-		for (const auto &[cell, replacement] : replacements) {
-			auto y = index.port(cell, ID::Y);
-			auto input = index.sigmap(replacement);
-			PmuxRewrite rewrite(module, index, "one-hot state decode");
-			rewrite.removed = index.removable({cell}, {}, pool<SigBit>(y.begin(), y.end()), {input});
-			rewrite.connect(cell->getPort(ID::Y), input);
-			if (!rewrite.validate())
-				continue;
-			rewrite.commit();
-			++removed;
-		}
-		if (removed)
-			log("  %s: removed %d one-hot state decoders.\n", log_id(module), removed);
+		if (matches == GetSize(q))
+			replacement = State::S1;
+		else if (matches > 1)
+			return false;
+
+		auto y = index.port(cell, ID::Y);
+		auto input = index.sigmap(replacement);
+		PmuxRewrite rewrite(module, index, "one-hot state decode");
+		rewrite.removed = index.removable({cell}, {}, pool<SigBit>(y.begin(), y.end()), {input});
+		rewrite.connect(cell->getPort(ID::Y), input);
+		if (!rewrite.validate())
+			return false;
+		rewrite.commit();
+		return true;
 	}
 
 	struct Capture {
@@ -352,7 +341,7 @@ class StateWorker
 		return rows.front();
 	}
 
-	bool compress_banks(Cell *mux)
+	bool compress_bank_group(Cell *mux)
 	{
 		if (!pmux_select_shape(mux) || !index.editable(mux))
 			return false;
@@ -468,19 +457,35 @@ class StateWorker
 public:
 	explicit StateWorker(Module *module) : module(module), index(module), initvals(&index.sigmap, module) {}
 
-	void run()
+	int compress_banks()
 	{
 		std::vector<IdString> muxes;
 		for (auto cell : module->selected_cells())
 			if (cell->type == ID($pmux))
 				muxes.push_back(cell->name);
-		int groups = 0, before = module->cells_size();
+		int groups = 0;
 		for (auto name : muxes)
-			if (auto mux = module->cell(name))
-				groups += compress_banks(mux);
-		if (groups)
-		log("  %s: compressed %d synchronous register groups (net RTLIL cell change: %+d).\n", log_id(module), groups, module->cells_size() - before);
-		replace_decodes();
+			if (auto mux = module->cell(name); mux && mux->type == ID($pmux))
+				groups += compress_bank_group(mux);
+		return groups;
+	}
+
+	int replace_decodes()
+	{
+		std::vector<IdString> decodes;
+		for (auto cell : module->selected_cells())
+			if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
+				decodes.push_back(cell->name);
+		dict<Cell *, bool> onehot_states;
+		int removed = 0;
+		for (auto name : decodes) {
+			auto cell = module->cell(name);
+			if (!cell || !replace_decode(cell, onehot_states))
+				continue;
+			onehot_states.clear();
+			++removed;
+		}
+		return removed;
 	}
 };
 
@@ -500,9 +505,18 @@ struct OptPmuxStatePass : Pass {
 		log_header(design, "Executing OPT_PMUX_STATE pass.\n");
 		if (pmux_coarse_observes_undef(design))
 			return;
-		for (auto module : design->selected_modules())
-			if (module->processes.empty())
-				StateWorker(module).run();
+		for (auto module : design->selected_modules()) {
+			if (!module->processes.empty())
+				continue;
+			StateWorker worker(module);
+			int before = module->cells_size();
+			int groups = worker.compress_banks();
+			if (groups)
+				log("  %s: compressed %d synchronous register groups (net RTLIL cell change: %+d).\n", log_id(module), groups, module->cells_size() - before);
+			int decodes = worker.replace_decodes();
+			if (decodes)
+				log("  %s: removed %d one-hot state decoders.\n", log_id(module), decodes);
+		}
 	}
 } OptPmuxStatePass;
 
