@@ -62,6 +62,21 @@ class PmuxCoarseIndex
 	mutable Index index;
 	mutable std::optional<std::vector<Wire *>> protected_wires;
 	mutable pool<SigBit> kept_bits, inout_bits;
+	// index.revision 变化时清空查询缓存。
+	mutable size_t cache_revision = 0;
+	mutable dict<SigBit, std::optional<ModIndex::PortInfo>> source_cache;
+	mutable dict<SigBit, bool> module_input_cache;
+	mutable dict<std::pair<Cell *, IdString>, bool> editable_cache;
+
+	void refresh_caches() const
+	{
+		if (cache_revision == index.revision)
+			return;
+		source_cache.clear();
+		module_input_cache.clear();
+		editable_cache.clear();
+		cache_revision = index.revision;
+	}
 
 	void refresh_protected_bits() const
 	{
@@ -145,21 +160,14 @@ public:
 
 	std::optional<Port> source(SigBit bit) const
 	{
-		if (!bit.wire)
+		if (!bit.wire || bit.wire->module != module)
 			return std::nullopt;
-		const auto *info = index.query(bit);
-		if (!info || info->is_input)
-			return std::nullopt;
-		std::optional<Port> driver;
-		for (const auto &port : info->ports) {
-			auto direction = port.cell->port_dir(port.port);
-			if (direction == RTLIL::PD_INPUT)
-				continue;
-			if (direction != RTLIL::PD_OUTPUT || driver)
-				return std::nullopt;
-			driver = port;
-		}
-		return driver;
+		refresh_caches();
+		if (auto found = source_cache.find(bit); found != source_cache.end())
+			return found->second;
+		auto result = find_source(bit);
+		source_cache.emplace(bit, result);
+		return result;
 	}
 
 	Cell *driver(SigBit bit) const
@@ -170,24 +178,26 @@ public:
 
 	bool module_input(SigBit bit) const
 	{
-		const auto *info = index.query(bit);
-		if (!info || !info->is_input)
+		if (!bit.wire || bit.wire->module != module)
 			return false;
-		refresh_protected_bits();
-		return !inout_bits.count(sigmap(bit)) && std::all_of(info->ports.begin(), info->ports.end(), [](const auto &port) {
-			return port.cell->port_dir(port.port) == RTLIL::PD_INPUT;
-		});
+		refresh_caches();
+		if (auto found = module_input_cache.find(bit); found != module_input_cache.end())
+			return found->second;
+		bool result = find_module_input(bit);
+		module_input_cache.emplace(bit, result);
+		return result;
 	}
 
 	bool editable(Cell *cell, IdString name = ID::Y) const
 	{
-		if (!editable_cell(cell) || !cell->hasPort(name) || cell->port_dir(name) != RTLIL::PD_OUTPUT)
-			return false;
-		auto output = port(cell, name);
-		for (int offset = 0; offset < GetSize(output); ++offset)
-			if (!editable_output(cell, name, offset, output[offset]))
-				return false;
-		return !output.empty();
+		log_assert(cell->module == module);
+		refresh_caches();
+		auto key = std::make_pair(cell, name);
+		if (auto found = editable_cache.find(key); found != editable_cache.end())
+			return found->second;
+		bool result = find_editable(cell, name);
+		editable_cache.emplace(key, result);
+		return result;
 	}
 
 	// replaced_users 的旧输入连接会移除，新增或保留的输入必须纳入 retained_inputs。
@@ -214,6 +224,47 @@ public:
 	}
 
 private:
+	std::optional<Port> find_source(SigBit bit) const
+	{
+		if (!bit.wire)
+			return std::nullopt;
+		const auto *info = index.query(bit);
+		if (!info || info->is_input)
+			return std::nullopt;
+		std::optional<Port> driver;
+		for (const auto &port : info->ports) {
+			auto direction = port.cell->port_dir(port.port);
+			if (direction == RTLIL::PD_INPUT)
+				continue;
+			if (direction != RTLIL::PD_OUTPUT || driver)
+				return std::nullopt;
+			driver = port;
+		}
+		return driver;
+	}
+
+	bool find_module_input(SigBit bit) const
+	{
+		const auto *info = index.query(bit);
+		if (!info || !info->is_input)
+			return false;
+		refresh_protected_bits();
+		return !inout_bits.count(sigmap(bit)) && std::all_of(info->ports.begin(), info->ports.end(), [](const auto &port) {
+			return port.cell->port_dir(port.port) == RTLIL::PD_INPUT;
+		});
+	}
+
+	bool find_editable(Cell *cell, IdString name) const
+	{
+		if (!editable_cell(cell) || !cell->hasPort(name) || cell->port_dir(name) != RTLIL::PD_OUTPUT)
+			return false;
+		auto output = port(cell, name);
+		for (int offset = 0; offset < GetSize(output); ++offset)
+			if (!editable_output(cell, name, offset, output[offset]))
+				return false;
+		return !output.empty();
+	}
+
 	pool<SigBit> normalize_bits(const pool<SigBit> &bits) const
 	{
 		pool<SigBit> normalized;
