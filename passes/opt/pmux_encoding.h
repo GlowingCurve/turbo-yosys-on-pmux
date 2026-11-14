@@ -9,20 +9,38 @@
 
 YOSYS_NAMESPACE_BEGIN
 
-inline constexpr int pmux_max_controls = 6;
-inline constexpr int pmux_max_rows = 1 << pmux_max_controls;
-inline constexpr int pmux_max_table_bits = 32768;
-
 struct PmuxPartialCode
 {
 	unsigned zero, one;
 };
 
-struct PmuxBranchChoice
-{
-	// -1 是默认分支，-2 表示无确定的选择结果。
-	int first = -2, second = -2;
+enum class BranchKind { Constant, Selected, Dynamic };
+
+struct PmuxBranchChoice {
+	BranchKind kind = BranchKind::Constant;
+	int index = 0;
+	State val = State::Sx;
 };
+
+inline std::optional<std::vector<int>> pmux_branch_table(const std::vector<uint64_t> &truths, int controls,
+		uint64_t valid_mask = ~uint64_t(0))
+{
+	int rows = pmux_encoding_limit(controls);
+	if (rows != pmux_max_rows)
+		valid_mask &= (uint64_t(1) << rows) - 1;
+	uint64_t seen = 0;
+	std::vector<int> branches(rows);
+	for (int i = 0; i < GetSize(truths); ++i) {
+		uint64_t active = truths[i] & valid_mask;
+		if (seen & active)
+			return std::nullopt;
+		seen |= active;
+		for (int row = 0; row < rows; ++row)
+			if (active & (uint64_t(1) << row))
+				branches[row] = i + 1;
+	}
+	return branches;
+}
 
 class PmuxEncoding
 {
@@ -75,15 +93,16 @@ class PmuxEncoding
 		return result;
 	}
 
-	const PmuxCoarseIndex &index;
-	dict<SigBit, uint64_t> decoded;
+	PmuxCoarseIndex &index;
+	dict<SigBit, uint64_t> truths_;
 	pool<SigBit> active;
-	pool<SigBit> *dependencies;
+	std::vector<SigBit> controls_;
+	dict<SigBit, int> slots_;
+	pool<Cell *> cells_;
+	bool decoded_ = false;
 
 	std::optional<uint64_t> literal(SigBit bit)
 	{
-		if (dependencies && bit.wire)
-			dependencies->insert(bit);
 		if (!bit.wire) {
 			if (bit == State::S0)
 				return 0;
@@ -93,108 +112,83 @@ class PmuxEncoding
 		}
 		if (active.count(bit))
 			return std::nullopt;
-		auto slot = slots.find(bit);
-		if (slot != slots.end())
+		auto slot = slots_.find(bit);
+		if (slot != slots_.end())
 			return patterns[slot->second];
-		auto known = decoded.find(bit);
-		if (known != decoded.end())
+		auto known = truths_.find(bit);
+		if (known != truths_.end())
 			return known->second;
-		if (GetSize(controls) == pmux_max_controls)
+		if (GetSize(controls_) == pmux_max_controls)
 			return std::nullopt;
-		int position = GetSize(controls);
-		controls.push_back(bit);
-		slots[bit] = position;
-		return patterns[position];
-	}
-
-	template<typename Truth, typename Read>
-	std::optional<Truth> comparison(Cell *cell, const Read &read) const
-	{
-		auto operands = index.comparison_operands(cell, pmux_max_rows);
-		if (!operands)
-			return std::nullopt;
-		const auto &[a, b] = *operands;
-
-		Truth equal = ~Truth{};
-		for (int i = 0; i < GetSize(a); ++i) {
-			auto lhs = read(a[i], GetSize(a) == 1);
-			auto rhs = read(b[i], GetSize(b) == 1);
-			if (!lhs || !rhs)
-				return std::nullopt;
-			equal = equal & ~(*lhs ^ *rhs);
-		}
-		return cell->type == ID($ne) ? ~equal : equal;
+		slots_[bit] = GetSize(controls_);
+		controls_.push_back(bit);
+		return patterns[controls_.size() - 1];
 	}
 
 	template<typename Truth, typename Read>
 	std::optional<Truth> gate(Cell *cell, const Read &read) const
 	{
-		if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
-			return comparison<Truth>(cell, read);
-		auto a = index.port(cell, ID::A);
-		auto reduce = [&](const SigSpec &inputs, IdString type) -> std::optional<Truth> {
+		auto type = cell->type;
+		if (type.in(ID($eq), ID($ne), ID($logic_not))) {
+			auto operands = pmux_comparison_operands(cell, pmux_max_rows, index.sigmap);
+			if (!operands)
+				return std::nullopt;
+			const auto &[a, b] = *operands;
+			Truth equal = ~Truth{};
+			for (int i = 0; i < GetSize(a); ++i) {
+				auto lhs = read(a[i], GetSize(a) == 1);
+				auto rhs = read(b[i], GetSize(a) == 1);
+				if (!lhs || !rhs)
+					return std::nullopt;
+				equal = equal & ~(*lhs ^ *rhs);
+			}
+			return type == ID($ne) ? ~equal : equal;
+		}
+		auto operand = [&](IdString port, IdString reduction = {}) -> std::optional<Truth> {
+			auto inputs = index.port(cell, port);
+			if (reduction.empty())
+				return GetSize(inputs) == 1 ? read(inputs[0], true) : std::nullopt;
 			if (GetSize(inputs) > pmux_max_rows)
 				return std::nullopt;
-			bool is_and = type == ID($reduce_and);
-			bool is_xor = type.in(ID($reduce_xor), ID($reduce_xnor));
+			bool is_and = reduction == ID($reduce_and);
+			bool is_xor = reduction.in(ID($reduce_xor), ID($reduce_xnor));
 			Truth result = is_and ? ~Truth{} : Truth{};
 			for (auto bit : inputs) {
 				auto input = read(bit, true);
 				if (!input)
 					return std::nullopt;
-				if (is_and)
-					result = result & *input;
-				else if (is_xor)
-					result = result ^ *input;
-				else
-					result = result | *input;
+				result = is_and ? result & *input : is_xor ? result ^ *input : result | *input;
 			}
-			return type == ID($reduce_xnor) ? ~result : result;
+			return reduction == ID($reduce_xnor) ? ~result : result;
 		};
-		if (cell->type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor)))
-			return reduce(a, cell->type);
-		if (cell->type.in(ID($logic_and), ID($logic_or))) {
-			auto lhs = reduce(a, ID($reduce_or));
-			if (!lhs)
-				return std::nullopt;
-			auto rhs = reduce(index.port(cell, ID::B), ID($reduce_or));
-			if (!rhs)
-				return std::nullopt;
-			return cell->type == ID($logic_and) ? *lhs & *rhs : *lhs | *rhs;
-		}
-		if (GetSize(a) != 1)
-			return std::nullopt;
-		auto lhs = read(a[0], true);
+		if (type.in(ID($reduce_or), ID($reduce_bool), ID($reduce_and), ID($reduce_xor), ID($reduce_xnor)))
+			return operand(ID::A, type);
+		IdString reduction = type.in(ID($logic_and), ID($logic_or)) ? ID($reduce_or) : IdString();
+		auto lhs = operand(ID::A, reduction);
 		if (!lhs)
 			return std::nullopt;
-		if (cell->type == ID($not))
+		if (type == ID($not))
 			return ~*lhs;
-		auto b = index.port(cell, ID::B);
-		if (GetSize(b) != 1)
-			return std::nullopt;
-		auto rhs = read(b[0], true);
+		auto rhs = operand(ID::B, reduction);
 		if (!rhs)
 			return std::nullopt;
-		if (cell->type == ID($mux)) {
-			auto s = index.port(cell, ID::S);
-			if (GetSize(s) != 1)
-				return std::nullopt;
-			auto select = read(s[0], true);
-			if (!select)
-				return std::nullopt;
-			return mux_truth(*lhs, *rhs, *select);
+		if (type == ID($mux)) {
+			auto select = operand(ID::S);
+			return select ? std::optional<Truth>{mux_truth(*lhs, *rhs, *select)} : std::nullopt;
 		}
-		if (cell->type == ID($and))
+		if (type.in(ID($and), ID($logic_and)))
 			return *lhs & *rhs;
-		if (cell->type == ID($or))
+		if (type.in(ID($or), ID($logic_or)))
 			return *lhs | *rhs;
-		return cell->type == ID($xnor) ? ~(*lhs ^ *rhs) : *lhs ^ *rhs;
+		log_assert(type.in(ID($xor), ID($xnor)));
+		auto parity = *lhs ^ *rhs;
+		return type == ID($xnor) ? ~parity : parity;
 	}
 
 	std::optional<TernaryTruth> ternary_truth(SigBit bit, dict<SigBit, TernaryTruth> &cache) const
 	{
-		auto slot = slots.find(bit);
-		if (slot != slots.end())
+		auto slot = slots_.find(bit);
+		if (slot != slots_.end())
 			return ternary_patterns()[slot->second];
 		if (!bit.wire) {
 			if (bit == State::S0)
@@ -206,7 +200,7 @@ class PmuxEncoding
 		auto found = cache.find(bit);
 		if (found != cache.end())
 			return found->second;
-		if (!decoded.count(bit))
+		if (!truths_.count(bit))
 			return std::nullopt;
 		auto source = index.source(bit);
 		log_assert(source.has_value());
@@ -219,23 +213,27 @@ class PmuxEncoding
 	}
 
 public:
-	std::vector<SigBit> controls;
-	dict<SigBit, int> slots;
-	pool<Cell *> cells;
+	explicit PmuxEncoding(PmuxCoarseIndex &index) : index(index) {}
+	const std::vector<SigBit> &controls() const { return controls_; }
+	const dict<SigBit, int> &slots() const { return slots_; }
+	const pool<Cell *> &cells() const { return cells_; }
 
-	explicit PmuxEncoding(const PmuxCoarseIndex &index, pool<SigBit> *dependencies = nullptr) : index(index), dependencies(dependencies) {}
+	SigSpec control_key() const
+	{
+		auto sorted = controls_;
+		std::sort(sorted.begin(), sorted.end());
+		return SigSpec(sorted);
+	}
 
 	std::optional<uint64_t> pin(SigBit bit) { return literal(index.sigmap(bit)); }
 
 	std::optional<uint64_t> decode(SigBit bit, int depth = 12)
 	{
 		bit = index.sigmap(bit);
-		if (dependencies && bit.wire)
-			dependencies->insert(bit);
-		if (slots.count(bit))
+		if (slots_.count(bit))
 			return literal(bit);
-		auto found = decoded.find(bit);
-		if (found != decoded.end())
+		auto found = truths_.find(bit);
+		if (found != truths_.end())
 			return found->second;
 		auto source = index.source(bit);
 		if (!source || source->port != ID::Y || GetSize(source->cell->getPort(ID::Y)) != 1)
@@ -245,21 +243,22 @@ public:
 				ID($reduce_xor), ID($reduce_xnor), ID($not), ID($and), ID($or), ID($xor), ID($xnor),
 				ID($logic_and), ID($logic_or), ID($mux)))
 			return literal(bit);
-		if (depth == 0 || GetSize(cells) >= 128 || !active.insert(bit).second)
+		if (depth == 0 || GetSize(cells_) >= 128 || !active.insert(bit).second)
 			return std::nullopt;
 		auto result = gate<uint64_t>(cell, [&](SigBit input, bool recursive) {
 			return recursive ? decode(input, depth - 1) : literal(input);
 		});
 		active.erase(bit);
 		if (result) {
-			cells.insert(cell);
-			decoded[bit] = *result;
+			cells_.insert(cell);
+			truths_[bit] = *result;
 		}
 		return result;
 	}
 
 	bool branch_tables(const std::vector<SigSpec> &selects, std::vector<std::vector<int>> &tables)
 	{
+		decoded_ = false;
 		std::vector<std::vector<uint64_t>> truths;
 		for (const auto &select : selects) {
 			auto &truth = truths.emplace_back();
@@ -270,22 +269,14 @@ public:
 				truth.push_back(*value);
 			}
 		}
-		int rows = 1 << GetSize(controls);
-		uint64_t valid_rows = rows == pmux_max_rows ? ~uint64_t(0) : (uint64_t(1) << rows) - 1;
 		tables.clear();
 		for (const auto &truth : truths) {
-			uint64_t seen = 0;
-			auto &branches = tables.emplace_back(rows, -1);
-			for (int i = 0; i < GetSize(truth); ++i) {
-				uint64_t active_rows = truth[i] & valid_rows;
-				if (seen & active_rows)
-					return false;
-				seen |= active_rows;
-				for (int code = 0; code < rows; ++code)
-					if (active_rows & (uint64_t(1) << code))
-						branches[code] = i;
-			}
+			auto branches = pmux_branch_table(truth, GetSize(controls_));
+			if (!branches)
+				return false;
+			tables.push_back(std::move(*branches));
 		}
+		decoded_ = true;
 		return true;
 	}
 
@@ -300,8 +291,8 @@ public:
 
 	std::vector<PmuxPartialCode> partial_codes() const
 	{
-		std::vector<PmuxPartialCode> result(powers_of_three[GetSize(controls)]);
-		for (int slot = 0; slot < GetSize(controls); ++slot)
+		std::vector<PmuxPartialCode> result(powers_of_three[GetSize(controls_)]);
+		for (int slot = 0; slot < GetSize(controls_); ++slot)
 			for (int row = 0; row < GetSize(result); ++row) {
 				if (ternary_patterns()[slot].zero[row])
 					result[row].zero |= 1u << slot;
@@ -313,35 +304,31 @@ public:
 
 	std::vector<std::vector<PmuxBranchChoice>> partial_branches(const std::vector<Cell *> &selections) const
 	{
+		log_assert(decoded_);
 		dict<SigBit, TernaryTruth> cache;
 		std::vector<std::vector<PmuxBranchChoice>> result;
-		int count = powers_of_three[GetSize(controls)];
+		int count = powers_of_three[GetSize(controls_)];
 		for (auto cell : selections) {
 			std::vector<TernaryTruth> predicates;
 			for (auto bit : index.port(cell, ID::S)) {
 				auto truth = ternary_truth(bit, cache);
-				if (!truth)
-					return {};
+				log_assert(truth.has_value());
 				predicates.push_back(std::move(*truth));
 			}
 			auto &choices = result.emplace_back(count);
 			for (int row = 0; row < count; ++row) {
-				int selected = -1;
-				bool undefined = false;
+				auto &choice = choices[row];
+				choice.kind = BranchKind::Selected;
 				for (int branch = 0; branch < GetSize(predicates); ++branch) {
 					const auto &predicate = predicates[branch];
 					if (predicate.zero[row])
 						continue;
-					if (selected >= 0 || !predicate.one[row]) {
-						undefined = true;
+					if (choice.index || !predicate.one[row]) {
+						choice = {cell->type == ID($mux) ? BranchKind::Dynamic : BranchKind::Constant, 0, State::Sx};
 						break;
 					}
-					selected = branch;
+					choice.index = branch + 1;
 				}
-				if (!undefined)
-					choices[row].first = selected;
-				else if (cell->type == ID($mux))
-					choices[row] = {-1, 0};
 			}
 		}
 		return result;
@@ -357,13 +344,6 @@ inline bool pmux_select_shape(Cell *cell)
 	return width > 0 && width <= pmux_max_table_bits && branches > 0 && branches <= pmux_max_rows &&
 		GetSize(cell->getPort(ID::A)) == width && GetSize(cell->getPort(ID::B)) == width * branches &&
 		(cell->type == ID($pmux) || branches == 1);
-}
-
-inline SigSpec pmux_control_key(const PmuxEncoding &encoding)
-{
-	auto sorted = encoding.controls;
-	std::sort(sorted.begin(), sorted.end());
-	return SigSpec(sorted);
 }
 
 YOSYS_NAMESPACE_END

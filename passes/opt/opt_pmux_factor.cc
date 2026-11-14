@@ -1,5 +1,6 @@
 #include "kernel/log.h"
 #include "kernel/register.h"
+#include "pmux_common.h"
 #include "pmux_rewrite.h"
 
 #include <algorithm>
@@ -7,245 +8,77 @@
 #include <map>
 #include <optional>
 #include <set>
-#include <tuple>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-bool unspecified(const SigSpec &value)
+std::vector<SigSpec> choice_branches(PmuxCoarseIndex &index, Cell *cell)
 {
-	return value.is_fully_const() && value.as_const().is_fully_undef_x_only();
+	auto a = index.port(cell, ID::A), b = index.port(cell, ID::B);
+	int width = GetSize(cell->getPort(ID::Y)), selects = GetSize(cell->getPort(ID::S));
+	log_assert(cell->type == ID($pmux) || (cell->type == ID($mux) && selects == 1));
+	log_assert(GetSize(a) == width && GetSize(b) == width * selects);
+	std::vector<SigSpec> branches{a};
+	for (int i = 0; i < selects; ++i)
+		branches.push_back(b.extract(i * width, width));
+	return branches;
 }
 
-struct FactorChoice
+// Collapse a choice when its defined branches agree, and report a generated selector by name.
+SigSpec build_choice(Module *module, const SigSpec &select, const std::vector<SigSpec> &values,
+		IdString type = ID($mux), IdString *created = nullptr)
 {
-	SigSpec select;
-	std::vector<SigSpec> branches;
-
-	static bool valid(Cell *cell)
-	{
-		if (!cell->type.in(ID($mux), ID($pmux)))
-			return false;
-		int selects = GetSize(cell->getPort(ID::S)), width = GetSize(cell->getPort(ID::Y));
-		return selects > 0 && (cell->type == ID($pmux) || selects == 1) &&
-				GetSize(cell->getPort(ID::A)) == width && GetSize(cell->getPort(ID::B)) == width * selects;
-	}
-
-	static std::optional<FactorChoice> read(PmuxCoarseIndex &index, Cell *cell)
-	{
-		if (!valid(cell))
-			return std::nullopt;
-		SigSpec select = index.port(cell, ID::S);
-		SigSpec a = index.port(cell, ID::A);
-		SigSpec b = index.port(cell, ID::B);
-		int width = GetSize(a);
-		FactorChoice choice{select, {a}};
-		for (int i = 0; i < GetSize(select); i++)
-			choice.branches.push_back(b.extract(i * width, width));
-		return choice;
-	}
-};
-
-// Use the defined value directly when every defined branch agrees.
-std::optional<SigSpec> common_value(const std::vector<SigSpec> &values)
-{
-	SigSpec common;
+	const SigSpec *common = nullptr;
 	for (const auto &value : values) {
-		if (unspecified(value))
+		if (value.is_fully_const() && value.as_const().is_fully_undef_x_only())
 			continue;
-		if (!common.empty() && common != value)
-			return std::nullopt;
-		common = value;
-	}
-	return common.empty() ? values.front() : common;
-}
-
-SigSpec emit_choice(Module *module, const SigSpec &select, const std::vector<SigSpec> &values, IdString type = ID($mux))
-{
-	if (auto common = common_value(values))
-		return *common;
-	SigSpec cases;
-	for (int i = 1; i < GetSize(values); i++)
-		cases.append(values[i]);
-	return type == ID($mux) && GetSize(select) == 1 ? module->Mux(NEW_ID, values.front(), cases, select)
-		: module->Pmux(NEW_ID, values.front(), cases, select);
-}
-
-std::optional<std::pair<Cell *, FactorChoice>> choice_input(PmuxCoarseIndex &index, const SigSpec &value)
-{
-	if (value.empty())
-		return std::nullopt;
-	Cell *cell = index.driver(value[0]);
-	if (!cell)
-		return std::nullopt;
-	auto choice = FactorChoice::read(index, cell);
-	if (!choice)
-		return std::nullopt;
-
-	std::vector<int> offsets;
-	for (auto bit : value) {
-		auto source = index.source(bit);
-		if (!source || source->cell != cell || source->port != ID::Y)
-			return std::nullopt;
-		offsets.push_back(source->offset);
-	}
-	if (index.port(cell, ID::Y) != value) {
-		for (auto &branch : choice->branches) {
-			SigSpec field;
-			for (int offset : offsets)
-				field.append(branch[offset]);
-			branch = std::move(field);
+		if (common && *common != value) {
+			SigSpec cases;
+			for (int i = 1; i < GetSize(values); ++i)
+				cases.append(values[i]);
+			auto name = NEW_ID;
+			if (created)
+				*created = name;
+			return type == ID($mux) && GetSize(select) == 1 ? module->Mux(name, values.front(), cases, select)
+					: module->Pmux(name, values.front(), cases, select);
 		}
+		common = &value;
 	}
-	return std::make_pair(cell, std::move(*choice));
+	return common ? *common : values.front();
 }
-
-bool prepare_factor(PmuxCoarseIndex &index, const pool<Cell *> &roots, const pool<Cell *> &region, PmuxRewrite &rewrite)
-{
-	pool<SigBit> input_bits, output_bits;
-	for (auto root : roots)
-		for (auto bit : index.port(root, ID::Y))
-			output_bits.insert(bit);
-	auto retain = [&](const SigSpec &input) {
-		for (auto bit : input)
-			if (bit.wire && bit.wire->module == index.module && !output_bits.count(index.sigmap(bit)))
-				input_bits.insert(bit);
-	};
-	for (Cell *cell : rewrite.staging.cells())
-		for (const auto &[port, signal] : cell->connections())
-			if (cell->input(port))
-				retain(signal);
-	for (const auto &connection : rewrite.staging.connections())
-		retain(connection.second);
-	rewrite.find_removable(region, {}, output_bits, input_bits);
-	return std::all_of(roots.begin(), roots.end(), [&](auto root) { return rewrite.removed.count(root); });
-}
-
-bool bitwise_type(IdString type)
-{
-	return type.in(ID($and), ID($or), ID($xor), ID($xnor));
-}
-
-struct FactorDriver
-{
-	SigSpec a, b;
-	SigBit select;
-
-	static FactorDriver read(PmuxCoarseIndex &index, Cell *cell)
-	{
-		auto a = index.port(cell, ID::A);
-		auto b = index.port(cell, ID::B);
-		if (cell->type == ID($mux))
-			return {a, b, index.port(cell, ID::S).as_bit()};
-		bool is_signed = cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
-		int width = GetSize(cell->getPort(ID::Y));
-		a.extend_u0(width, is_signed);
-		b.extend_u0(width, is_signed);
-		return {a, b, {}};
-	}
-};
 
 struct FactorBit
 {
 	SigBit value;
-	Cell *producer;
+	Cell *producer = nullptr;
 	SigBit a, b, select;
-
-	static FactorBit read(PmuxCoarseIndex &index, dict<Cell *, FactorDriver> &drivers, SigBit bit)
-	{
-		auto source = index.source(bit);
-		if (!source || source->port != ID::Y ||
-				(source->cell->type != ID($mux) && !bitwise_type(source->cell->type)))
-			return {bit, nullptr, {}, {}, {}};
-		Cell *cell = source->cell;
-		auto entry = drivers.find(cell);
-		if (entry == drivers.end())
-			entry = drivers.emplace(cell, FactorDriver::read(index, cell)).first;
-		const auto &driver = entry->second;
-		return {bit, cell, driver.a[source->offset], driver.b[source->offset], driver.select};
-	}
 };
 
 struct FactorField
 {
+	enum class Input { FixedOperands, SelectedOperand, SelectedControl };
+	Input input = Input::FixedOperands;
 	IdString type;
 	std::vector<int> offsets;
 	SigSpec a, b;
 	std::vector<SigSpec> branches;
-	pool<Cell *> producers;
+	pool<IdString> producers;
 
-	bool operator==(const FactorField &other) const
+	void append(int offset, SigBit left, const pool<IdString> &cells)
 	{
-		return std::tie(type, offsets, a, b, branches) == std::tie(other.type, other.offsets, other.a, other.b, other.branches);
+		offsets.push_back(offset);
+		a.append(left);
+		producers.insert(cells.begin(), cells.end());
 	}
 
 	SigSpec emit(Module *module, const SigSpec &select) const
 	{
-		auto input = branches.empty() ? b : emit_choice(module, select, branches);
-		if (type == ID($mux))
-			return module->Mux(NEW_ID, a, b, input);
-		Wire *output = module->addWire(NEW_ID, GetSize(a));
-		if (type == ID($and))
-			module->addAnd(NEW_ID, a, input, output);
-		else if (type == ID($or))
-			module->addOr(NEW_ID, a, input, output);
-		else if (type == ID($xor))
-			module->addXor(NEW_ID, a, input, output);
-		else
-			module->addXnor(NEW_ID, a, input, output);
-		return output;
+		auto operand = input == Input::FixedOperands ? b : build_choice(module, select, branches);
+		if (input == Input::SelectedControl)
+			return module->Mux(NEW_ID, a, b, operand);
+		return pmux_emit_bitwise_choice(module, type, a, operand);
 	}
 };
-
-struct ChoiceColumns
-{
-	struct Column {
-		SigSpec values;
-		SigBit output;
-	};
-	std::vector<Column> columns;
-	std::vector<dict<SigBit, std::vector<int>>> by_branch;
-	dict<SigSpec, std::vector<int>> exact, without_default;
-
-	void add(PmuxCoarseIndex &index, Cell *cell, const FactorChoice &choice)
-	{
-		by_branch.resize(choice.branches.size());
-		auto output = index.port(cell, ID::Y);
-		for (int offset = 0; offset < GetSize(output); ++offset) {
-			auto source = index.source(output[offset]);
-			if (!source || source->cell != cell || source->port != ID::Y || source->offset != offset)
-				continue;
-			int column = GetSize(columns);
-			SigSpec values;
-			for (int branch = 0; branch < GetSize(choice.branches); ++branch) {
-				auto value = choice.branches[branch][offset];
-				values.append(value);
-				by_branch[branch][value].push_back(column);
-			}
-			exact[values].push_back(column);
-			if (cell->type == ID($pmux))
-				without_default[values.extract(1, GetSize(values) - 1)].push_back(column);
-			columns.push_back({std::move(values), output[offset]});
-		}
-	}
-};
-
-State bitwise_value(IdString type, State a, State b)
-{
-	if (type == ID($and)) {
-		if (a == State::S0 || b == State::S0)
-			return State::S0;
-		return a == State::S1 && b == State::S1 ? State::S1 : State::Sx;
-	}
-	if (type == ID($or)) {
-		if (a == State::S1 || b == State::S1)
-			return State::S1;
-		return a == State::S0 && b == State::S0 ? State::S0 : State::Sx;
-	}
-	if (a > State::S1 || b > State::S1)
-		return State::Sx;
-	return ((a != b) == (type == ID($xor))) ? State::S1 : State::S0;
-}
 
 bool preserves_unknown_select(IdString type, const SigSpec &a, const SigSpec &b)
 {
@@ -258,52 +91,61 @@ bool preserves_unknown_select(IdString type, const SigSpec &a, const SigSpec &b)
 			count *= 3;
 	for (int code = 0; code < count; ++code) {
 		auto value = [&](SigBit bit) {
-			if (!bit.wire)
-				return bit.data <= State::S1 ? bit.data : State::Sx;
-			return State(code / weights.at(bit) % 3);
+			static constexpr std::array<State, 3> states{State::S0, State::S1, State::Sx};
+			return bit.wire ? states[code / weights.at(bit) % 3] : bit.data;
 		};
 		auto a0 = value(inputs[0]), b0 = value(inputs[1]), a1 = value(inputs[2]), b1 = value(inputs[3]);
-		auto first = bitwise_value(type, a0, b0);
-		if (first <= State::S1 && first == bitwise_value(type, a1, b1) &&
-				first != bitwise_value(type, a0 == a1 ? a0 : State::Sx, b0 == b1 ? b0 : State::Sx))
+		auto first = pmux_eval_bitwise(type, a0, b0);
+		if (first != State::Sx && first == pmux_eval_bitwise(type, a1, b1) &&
+				first != pmux_eval_bitwise(type, a0 == a1 ? a0 : State::Sx, b0 == b1 ? b0 : State::Sx))
 			return false;
 	}
 	return true;
 }
 
+struct ChoiceColumns
+{
+	struct Column { SigSpec values; SigBit output; };
+	std::vector<Column> columns;
+	std::vector<dict<SigBit, std::vector<int>>> by_branch;
+	dict<SigSpec, std::vector<int>> exact, without_default;
+};
+
 void match_reusable_field(PmuxCoarseIndex &index, Cell *root, const pool<SigBit> &outputs, int offset,
-		const std::vector<FactorBit> &bits, const ChoiceColumns &available, std::map<IdString, FactorField> &fields,
+		const std::vector<FactorBit> &bits, const ChoiceColumns &available, std::map<IdString, FactorField> &reused,
 		std::map<IdString, FactorField> &single_operand)
 {
 	bool ignore_default = root->type == ID($pmux) && bits.front().value == State::Sx;
 	int first = ignore_default ? 1 : 0;
-	if (!bits[first].producer || !bitwise_type(bits[first].producer->type))
+	if (!bits[first].producer || bits[first].producer->type == ID($mux))
 		return;
 	IdString type = bits[first].producer->type;
-	const std::vector<int> *left_candidates = nullptr, *right_candidates = nullptr;
+	std::array<const std::vector<int> *, 2> candidates{};
 	int fewest = GetSize(available.columns) + 1;
-	pool<Cell *> producers;
+	pool<IdString> producers;
 	for (int branch = first; branch < GetSize(bits); ++branch) {
 		const auto &bit = bits[branch];
 		if (!bit.producer || bit.producer->type != type)
 			return;
-		producers.insert(bit.producer);
+		producers.insert(bit.producer->name);
 		const auto &row = available.by_branch[branch];
 		auto left = row.find(bit.a), right = row.find(bit.b);
 		int size = (left == row.end() ? 0 : GetSize(left->second)) +
 				(right == row.end() || bit.a == bit.b ? 0 : GetSize(right->second));
 		if (size < fewest) {
 			fewest = size;
-			left_candidates = left == row.end() ? nullptr : &left->second;
-			right_candidates = right == row.end() || bit.a == bit.b ? nullptr : &right->second;
+			candidates = {left == row.end() ? nullptr : &left->second,
+					right == row.end() || bit.a == bit.b ? nullptr : &right->second};
 		}
 	}
 
-	std::optional<std::pair<SigBit, SigSpec>> missing_selection;
-	for (const auto *candidates : {left_candidates, right_candidates}) {
-		if (!candidates)
+	SigBit existing_operand;
+	SigSpec missing_operand;
+	const auto &lookup = ignore_default ? available.without_default : available.exact;
+	for (const auto *row : candidates) {
+		if (!row)
 			continue;
-		for (int column : *candidates) {
+		for (int column : *row) {
 			const auto &left = available.columns[column];
 			if (outputs.count(left.output))
 				continue;
@@ -316,45 +158,39 @@ void match_reusable_field(PmuxCoarseIndex &index, Cell *root, const pool<SigBit>
 			}
 			if (GetSize(values) != GetSize(bits) - first)
 				continue;
-			const auto &lookup = ignore_default ? available.without_default : available.exact;
-			auto matching = lookup.find(values);
 			if (root->type == ID($mux) && !preserves_unknown_select(type, left.values, values))
 				continue;
-			if (matching != lookup.end()) {
+			if (auto matching = lookup.find(values); matching != lookup.end()) {
 				for (int other : matching->second) {
 					SigBit right = available.columns[other].output;
 					if (outputs.count(right) || !index.independent({left.output, right}, outputs))
 						continue;
-					auto &field = fields[type];
+					auto &field = reused[type];
 					field.type = type;
-					field.offsets.push_back(offset);
-					field.a.append(left.output);
+					field.append(offset, left.output, producers);
 					field.b.append(right);
-					field.producers.insert(producers.begin(), producers.end());
 					return;
 				}
 			}
-			if (!missing_selection) {
+			if (!existing_operand.wire) {
 				pool<SigBit> inputs(values.begin(), values.end());
 				inputs.insert(left.output);
-				if (index.independent(inputs, outputs))
-					missing_selection.emplace(left.output, std::move(values));
+				if (index.independent(inputs, outputs)) {
+					existing_operand = left.output;
+					missing_operand = std::move(values);
+				}
 			}
 		}
 	}
-	if (!missing_selection)
+	if (!existing_operand.wire)
 		return;
-	const auto &[existing, values] = *missing_selection;
 	auto &field = single_operand[type];
+	field.input = FactorField::Input::SelectedOperand;
 	field.type = type;
-	field.offsets.push_back(offset);
-	field.a.append(existing);
+	field.append(offset, existing_operand, producers);
 	field.branches.resize(bits.size());
-	if (ignore_default)
-		field.branches.front().append(State::Sx);
-	for (int branch = first; branch < GetSize(bits); ++branch)
-		field.branches[branch].append(values[branch - first]);
-	field.producers.insert(producers.begin(), producers.end());
+	for (int branch = 0; branch < GetSize(bits); ++branch)
+		field.branches[branch].append(branch < first ? SigBit(State::Sx) : missing_operand[branch - first]);
 }
 
 void match_nested_fields(int offset, const std::vector<FactorBit> &bits,
@@ -364,41 +200,35 @@ void match_nested_fields(int offset, const std::vector<FactorBit> &bits,
 		if (!seed.producer || seed.producer->type != ID($mux))
 			continue;
 		std::vector<SigBit> conditions;
-		pool<Cell *> producers;
+		pool<IdString> producers;
 		for (const auto &branch : bits) {
-			if (branch.value == State::Sx)
-				conditions.emplace_back(State::Sx);
-			else if (branch.value == seed.a)
-				conditions.emplace_back(State::S0);
-			else if (branch.value == seed.b)
-				conditions.emplace_back(State::S1);
-			else if (branch.producer && branch.producer->type == ID($mux) && branch.a == seed.a && branch.b == seed.b) {
+			if (branch.value == State::Sx || branch.value == seed.a || branch.value == seed.b) {
+				conditions.emplace_back(branch.value == State::Sx ? State::Sx : branch.value == seed.a ? State::S0 : State::S1);
+			} else if (branch.producer && branch.producer->type == ID($mux) && branch.a == seed.a && branch.b == seed.b) {
 				conditions.push_back(branch.select);
-				producers.insert(branch.producer);
-			} else {
+				producers.insert(branch.producer->name);
+			} else
 				break;
-			}
 		}
 		if (conditions.size() != bits.size() || producers.empty())
 			continue;
 		auto &field = fields[conditions];
 		if (field.offsets.empty()) {
+			field.input = FactorField::Input::SelectedControl;
 			field.type = ID($mux);
 			for (auto condition : conditions)
 				field.branches.emplace_back(condition);
 		}
-		field.offsets.push_back(offset);
-		field.a.append(seed.a);
+		field.append(offset, seed.a, producers);
 		field.b.append(seed.b);
-		field.producers.insert(producers.begin(), producers.end());
 		break;
 	}
 }
 
-void match_bitwise_field(FactorField &field, int offset, const std::vector<FactorBit> &bits, SigBit common)
+bool match_bitwise_field(FactorField &field, int offset, const std::vector<FactorBit> &bits, SigBit common)
 {
 	std::vector<SigBit> operands;
-	pool<Cell *> producers;
+	pool<IdString> producers;
 	for (const auto &branch : bits) {
 		if (branch.value == State::Sx) {
 			operands.push_back(branch.value);
@@ -409,18 +239,17 @@ void match_bitwise_field(FactorField &field, int offset, const std::vector<Facto
 			continue;
 		}
 		if (!branch.producer || branch.producer->type != field.type || (branch.a != common && branch.b != common))
-			return;
+			return false;
 		operands.push_back(branch.a == common ? branch.b : branch.a);
-		producers.insert(branch.producer);
+		producers.insert(branch.producer->name);
 	}
 	if (producers.empty())
-		return;
-	field.offsets.push_back(offset);
-	field.a.append(common);
-	field.producers.insert(producers.begin(), producers.end());
+		return false;
+	field.append(offset, common, producers);
 	field.branches.resize(operands.size());
 	for (int i = 0; i < GetSize(operands); ++i)
 		field.branches[i].append(operands[i]);
+	return true;
 }
 
 void match_bitwise_fields(int offset, const std::vector<FactorBit> &bits,
@@ -428,151 +257,139 @@ void match_bitwise_fields(int offset, const std::vector<FactorBit> &bits,
 {
 	pool<IdString> matched_types;
 	for (const auto &seed : bits) {
-		if (!seed.producer || !bitwise_type(seed.producer->type) || !matched_types.insert(seed.producer->type).second)
+		if (!seed.producer || seed.producer->type == ID($mux) || !matched_types.insert(seed.producer->type).second)
 			continue;
 		for (int variant = 0; variant < GetSize(fields); ++variant) {
 			auto &field = fields[variant][seed.producer->type];
+			field.input = FactorField::Input::SelectedOperand;
 			field.type = seed.producer->type;
-			int size = GetSize(field.offsets);
-			match_bitwise_field(field, offset, bits, variant == 0 ? seed.a : seed.b);
-			if (GetSize(field.offsets) == size && seed.a != seed.b)
+			if (!match_bitwise_field(field, offset, bits, variant == 0 ? seed.a : seed.b) && seed.a != seed.b)
 				match_bitwise_field(field, offset, bits, variant == 0 ? seed.b : seed.a);
 		}
 	}
 }
 
 template <typename Match>
-void match_choice_fields(PmuxCoarseIndex &index, const FactorChoice &choice, Match match)
+void match_choice_fields(PmuxCoarseIndex &index, const std::vector<SigSpec> &branches, Match match)
 {
-	dict<Cell *, FactorDriver> drivers;
+	struct Inputs { SigSpec a, b; SigBit select; };
+	dict<Cell *, Inputs> drivers;
 	std::vector<FactorBit> bits;
-	bits.reserve(choice.branches.size());
-	for (int offset = 0; offset < GetSize(choice.branches.front()); ++offset) {
+	for (int offset = 0; offset < GetSize(branches.front()); ++offset) {
 		bits.clear();
-		for (const auto &branch : choice.branches)
-			bits.push_back(FactorBit::read(index, drivers, branch[offset]));
+		for (const auto &branch : branches) {
+			auto bit = branch[offset];
+			auto source = index.source(bit);
+			if (!source || source->port != ID::Y || !source->cell->type.in(ID($mux), ID($and), ID($or), ID($xor), ID($xnor))) {
+				bits.push_back({bit, nullptr, {}, {}, {}});
+				continue;
+			}
+			auto cell = source->cell;
+			auto [entry, inserted] = drivers.emplace(cell, Inputs{});
+			auto &[a, b, select] = entry->second;
+			if (inserted) {
+				a = index.port(cell, ID::A);
+				b = index.port(cell, ID::B);
+				if (cell->type == ID($mux))
+					select = index.port(cell, ID::S).as_bit();
+				else {
+					bool sign = pmux_is_signed_port(cell, ID::A) && pmux_is_signed_port(cell, ID::B);
+					int width = GetSize(cell->getPort(ID::Y));
+					a.extend_u0(width, sign);
+					b.extend_u0(width, sign);
+				}
+			}
+			bits.push_back({bit, cell, a[source->offset], b[source->offset], select});
+		}
 		match(offset, bits);
 	}
-}
-
-struct JointChoiceFields
-{
-	std::map<std::vector<SigBit>, FactorField> nested;
-	std::array<std::map<IdString, FactorField>, 2> bitwise;
-	std::map<IdString, FactorField> reusable, single_operand;
-};
-
-JointChoiceFields collect_joint_fields(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice, const ChoiceColumns *available)
-{
-	JointChoiceFields fields;
-	pool<SigBit> outputs;
-	if (available)
-		for (auto bit : index.port(root, ID::Y))
-			outputs.insert(bit);
-	match_choice_fields(index, choice, [&](int offset, const auto &bits) {
-		if (available)
-			match_reusable_field(index, root, outputs, offset, bits, *available, fields.reusable, fields.single_operand);
-		match_nested_fields(offset, bits, fields.nested);
-		match_bitwise_fields(offset, bits, fields.bitwise);
-	});
-	return fields;
 }
 
 struct ChoiceRewrite
 {
 	Cell *root;
-	const FactorChoice *choice;
+	const std::vector<SigSpec> *branches;
 	std::vector<const FactorField *> fields;
 };
 
+// Keep fields in preference order and omit fields that overlap one already chosen.
+template<typename Range, typename Field>
+void select_fields(const Range &range, Field field_of, pool<int> &occupied, std::vector<const FactorField *> &selected)
+{
+	for (const auto &entry : range) {
+		const auto &field = field_of(entry);
+		if (field.offsets.empty() || std::any_of(field.offsets.begin(), field.offsets.end(), [&](int offset) { return occupied.count(offset); }))
+			continue;
+		occupied.insert(field.offsets.begin(), field.offsets.end());
+		selected.push_back(&field);
+	}
+}
+
 bool apply_factor(PmuxCoarseIndex &index, const std::vector<ChoiceRewrite> &edits, const char *rule, bool require_reduction,
-		SigBit *remaining_choice = nullptr)
+		IdString *remaining_choice = nullptr)
 {
 	PmuxRewrite rewrite(index.module, index, rule);
-	pool<Cell *> roots, region;
-	for (const auto &[root, choice, fields] : edits) {
-		roots.insert(root);
+	pool<Cell *> region;
+	IdString residual;
+	for (const auto &[root, branches, fields] : edits) {
 		region.insert(root);
 		auto output = root->getPort(ID::Y);
+		auto select = index.port(root, ID::S);
 		pool<int> factored;
 		for (const auto *field : fields) {
-			region.insert(field->producers.begin(), field->producers.end());
+			for (auto name : field->producers)
+				if (auto cell = index.module->cell(name))
+					region.insert(cell);
 			SigSpec field_output;
 			for (int offset : field->offsets) {
 				log_assert(factored.insert(offset).second);
 				field_output.append(output[offset]);
 			}
-			rewrite.connect(field_output, field->emit(&rewrite.staging, choice->select));
+			rewrite.connect(field_output, field->emit(&rewrite.staging, select));
 		}
 		SigSpec remaining_output;
-		std::vector<SigSpec> remaining_branches(choice->branches.size());
+		std::vector<SigSpec> remaining_branches(branches->size());
 		for (int offset = 0; offset < GetSize(output); ++offset) {
 			if (factored.count(offset))
 				continue;
 			remaining_output.append(output[offset]);
 			for (int branch = 0; branch < GetSize(remaining_branches); ++branch)
-				remaining_branches[branch].append(choice->branches[branch][offset]);
+				remaining_branches[branch].append((*branches)[branch][offset]);
 		}
-		if (!remaining_output.empty()) {
-			if (remaining_choice && !common_value(remaining_branches))
-				*remaining_choice = remaining_output[0];
-			rewrite.connect(remaining_output, emit_choice(&rewrite.staging, choice->select, remaining_branches, root->type));
-		}
+		if (!remaining_output.empty())
+			rewrite.connect(remaining_output, build_choice(&rewrite.staging, select, remaining_branches, root->type, &residual));
 	}
-	if (!prepare_factor(index, roots, region, rewrite) || (require_reduction && GetSize(rewrite.removed) <= rewrite.added_count()))
+	rewrite.find_removable(region);
+	if (require_reduction && GetSize(rewrite.removed) <= rewrite.added_count())
 		return false;
 	for (const auto &edit : edits)
 		for (const auto *field : edit.fields)
-			if (std::none_of(field->producers.begin(), field->producers.end(), [&](Cell *cell) { return rewrite.removed.count(cell); }))
+			if (std::none_of(field->producers.begin(), field->producers.end(),
+					[&](IdString name) { return rewrite.removed.count(index.module->cell(name)); }))
 				return false;
 	if (!rewrite.validate())
 		return false;
 	rewrite.commit();
+	if (remaining_choice)
+		*remaining_choice = residual;
 	return true;
 }
 
-bool factor_nested_choice(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice, SigBit &remaining_choice)
+template<typename Maps>
+bool factor_local_fields(PmuxCoarseIndex &index, Cell *root, const std::vector<SigSpec> &branches, const Maps &matches,
+		const char *rule, IdString *remaining_choice = nullptr)
 {
-	std::map<std::vector<SigBit>, FactorField> matches;
-	match_choice_fields(index, choice, [&](int offset, const auto &bits) { match_nested_fields(offset, bits, matches); });
-	std::vector<const FactorField *> fields;
-	for (const auto &[conditions, field] : matches)
-		fields.push_back(&field);
-	auto apply = [&](const std::vector<const FactorField *> &candidate) {
-		remaining_choice = SigBit();
-		return apply_factor(index, {{root, &choice, candidate}}, "factor nested selections", false, &remaining_choice);
-	};
-	if (GetSize(fields) > 1 && apply(fields))
-		return true;
-	for (const auto *field : fields)
-		if (apply({field}))
-			return true;
-	return false;
-}
-
-bool factor_bitwise_choice(PmuxCoarseIndex &index, Cell *root, const FactorChoice &choice)
-{
-	std::array<std::map<IdString, FactorField>, 2> bitwise;
-	match_choice_fields(index, choice, [&](int offset, const auto &bits) { match_bitwise_fields(offset, bits, bitwise); });
 	auto apply = [&](const std::vector<const FactorField *> &fields) {
-		return apply_factor(index, {{root, &choice, fields}}, "factor bitwise operations", false);
+		return apply_factor(index, {{root, &branches, fields}}, rule, false, remaining_choice);
 	};
 	std::vector<const FactorField *> single_fields;
-	for (int variant = 0; variant < GetSize(bitwise); ++variant) {
-		if (variant == 1 && bitwise[0] == bitwise[1])
-			break;
+	for (const auto &variant : matches) {
 		std::vector<const FactorField *> fields;
 		pool<int> occupied;
-		for (const auto &[type, field] : bitwise[variant]) {
-			if (field.offsets.empty())
-				continue;
-			if (variant == 0 || !(field == bitwise[0].at(type)))
+		select_fields(variant, [](const auto &entry) -> const auto & { return entry.second; }, occupied, fields);
+		for (const auto &[type, field] : variant)
+			if (!field.offsets.empty())
 				single_fields.push_back(&field);
-			if (std::none_of(field.offsets.begin(), field.offsets.end(), [&](int offset) { return occupied.count(offset); })) {
-				fields.push_back(&field);
-				occupied.insert(field.offsets.begin(), field.offsets.end());
-			}
-		}
 		if (GetSize(fields) > 1 && apply(fields))
 			return true;
 	}
@@ -586,7 +403,7 @@ std::vector<IdString> selected_choices(Module *module)
 {
 	std::vector<IdString> choices;
 	for (auto cell : module->selected_cells())
-		if (cell->type.in(ID($mux), ID($pmux)))
+		if (pmux_has_selection_port(cell, ID::S) && !cell->getPort(ID::S).empty())
 			choices.push_back(cell->name);
 	std::sort(choices.begin(), choices.end());
 	return choices;
@@ -599,20 +416,21 @@ int factor_local_choices(PmuxCoarseIndex &index)
 		auto root = index.module->cell(name);
 		if (!root || !index.editable(root))
 			continue;
-		auto choice = FactorChoice::read(index, root);
-		if (!choice)
-			continue;
-		SigBit remaining_choice;
-		if (factor_nested_choice(index, root, *choice, remaining_choice)) {
+		auto branches = choice_branches(index, root);
+		std::array<std::map<std::vector<SigBit>, FactorField>, 1> nested;
+		match_choice_fields(index, branches, [&](int offset, const auto &bits) { match_nested_fields(offset, bits, nested.front()); });
+		IdString remaining_choice;
+		if (factor_local_fields(index, root, branches, nested, "factor nested selections", &remaining_choice)) {
 			++rewrites;
-			root = index.driver(remaining_choice);
-			if (!root || !index.editable(root))
+			if (remaining_choice.empty())
 				continue;
-			choice = FactorChoice::read(index, root);
-			if (!choice)
-				continue;
+			root = index.module->cell(remaining_choice);
+			log_assert(root && index.editable(root));
+			branches = choice_branches(index, root);
 		}
-		rewrites += factor_bitwise_choice(index, root, *choice);
+		std::array<std::map<IdString, FactorField>, 2> bitwise;
+		match_choice_fields(index, branches, [&](int offset, const auto &bits) { match_bitwise_fields(offset, bits, bitwise); });
+		rewrites += factor_local_fields(index, root, branches, bitwise, "factor bitwise operations");
 	}
 	return rewrites;
 }
@@ -624,13 +442,13 @@ dict<SelectKey, ChoiceColumns> reusable_columns(PmuxCoarseIndex &index, const st
 	dict<SelectKey, std::vector<Cell *>> groups;
 	for (auto name : choices) {
 		auto cell = index.module->cell(name);
-		if (FactorChoice::valid(cell) && index.editable(cell))
+		if (index.editable(cell))
 			groups[{cell->type, index.port(cell, ID::S)}];
 	}
 	if (groups.empty())
 		return {};
 	for (auto cell : index.module->cells()) {
-		if (!FactorChoice::valid(cell))
+		if (!pmux_has_selection_port(cell, ID::S) || cell->getPort(ID::S).empty())
 			continue;
 		if (auto group = groups.find({cell->type, index.port(cell, ID::S)}); group != groups.end())
 			group->second.push_back(cell);
@@ -640,10 +458,29 @@ dict<SelectKey, ChoiceColumns> reusable_columns(PmuxCoarseIndex &index, const st
 	for (auto &[key, members] : groups) {
 		if (GetSize(members) < 2)
 			continue;
-		std::sort(members.begin(), members.end(), [](auto a, auto b) { return a->name < b->name; });
+		std::sort(members.begin(), members.end(), RTLIL::sort_by_name_id<Cell>());
 		auto &columns = available[key];
-		for (auto cell : members)
-			columns.add(index, cell, *FactorChoice::read(index, cell));
+		for (auto cell : members) {
+			auto branches = choice_branches(index, cell);
+			auto output = index.port(cell, ID::Y);
+			columns.by_branch.resize(branches.size());
+			for (int offset = 0; offset < GetSize(output); ++offset) {
+				auto source = index.source(output[offset]);
+				if (!source || source->cell != cell || source->port != ID::Y || source->offset != offset)
+					continue;
+				int column = GetSize(columns.columns);
+				SigSpec values;
+				for (int branch = 0; branch < GetSize(branches); ++branch) {
+					auto bit = branches[branch][offset];
+					values.append(bit);
+					columns.by_branch[branch][bit].push_back(column);
+				}
+				columns.exact[values].push_back(column);
+				if (cell->type == ID($pmux))
+					columns.without_default[values.extract(1, GetSize(values) - 1)].push_back(column);
+				columns.columns.push_back({std::move(values), output[offset]});
+			}
+		}
 	}
 	return available;
 }
@@ -656,85 +493,87 @@ int factor_joint_choices(PmuxCoarseIndex &index)
 	auto available = reusable_columns(index, choices);
 
 	struct Candidate {
-		Cell *root;
-		FactorChoice choice;
-		std::vector<FactorField> fields, single_operand;
-		pool<Cell *> region;
-		int reused;
+		IdString root;
+		std::vector<SigSpec> branches;
+		std::vector<FactorField> reused_operands, local_fields, single_operand;
 	};
 	std::vector<Candidate> candidates;
-	dict<Cell *, std::vector<int>> readers;
+	dict<IdString, int> first_reader;
+	mfp<int> connected;
 	for (auto name : choices) {
 		auto root = index.module->cell(name);
-		if (!root || !index.editable(root))
+		if (!index.editable(root))
 			continue;
-		auto choice = FactorChoice::read(index, root);
-		if (!choice)
-			continue;
-		auto columns = available.find({root->type, choice->select});
-		auto fields = collect_joint_fields(index, root, *choice, columns == available.end() ? nullptr : &columns->second);
-		Candidate candidate{root, std::move(*choice), {}, {}, {root}, 0};
+		auto columns = available.find({root->type, index.port(root, ID::S)});
+		Candidate candidate{name, choice_branches(index, root), {}, {}, {}};
+		std::map<std::vector<SigBit>, FactorField> nested;
+		std::array<std::map<IdString, FactorField>, 2> bitwise;
+		std::map<IdString, FactorField> reusable, single_operand;
+		auto output = index.port(root, ID::Y);
+		pool<SigBit> outputs(output.begin(), output.end());
+		match_choice_fields(index, candidate.branches, [&](int offset, const auto &bits) {
+			if (columns != available.end())
+				match_reusable_field(index, root, outputs, offset, bits, columns->second, reusable, single_operand);
+			match_nested_fields(offset, bits, nested);
+			match_bitwise_fields(offset, bits, bitwise);
+		});
 		pool<int> occupied;
-		auto append = [&](auto &group) {
-			for (auto &[key, field] : group) {
-				if (field.offsets.empty() || std::any_of(field.offsets.begin(), field.offsets.end(),
-						[&](int offset) { return occupied.count(offset); }))
+		auto collect = [&](auto &matches, auto &destination) {
+			for (auto &[key, field] : matches) {
+				if (field.offsets.empty() || std::any_of(field.offsets.begin(), field.offsets.end(), [&](int offset) { return occupied.count(offset); }))
 					continue;
 				occupied.insert(field.offsets.begin(), field.offsets.end());
-				candidate.region.insert(field.producers.begin(), field.producers.end());
-				candidate.fields.push_back(std::move(field));
+				destination.push_back(std::move(field));
 			}
 		};
-		append(fields.reusable);
-		candidate.reused = GetSize(candidate.fields);
-		append(fields.nested);
-		for (auto &group : fields.bitwise)
-			append(group);
-		for (auto &[type, field] : fields.single_operand) {
-			candidate.region.insert(field.producers.begin(), field.producers.end());
+		collect(reusable, candidate.reused_operands);
+		collect(nested, candidate.local_fields);
+		for (auto &group : bitwise)
+			collect(group, candidate.local_fields);
+		for (auto &[type, field] : single_operand)
 			candidate.single_operand.push_back(std::move(field));
-		}
-		if (candidate.fields.empty() && candidate.single_operand.empty())
+		if (candidate.reused_operands.empty() && candidate.local_fields.empty() && candidate.single_operand.empty())
 			continue;
-		for (auto producer : candidate.region)
-			readers[producer].push_back(GetSize(candidates));
+		int member = GetSize(candidates);
+		connected.merge(member, first_reader.emplace(name, member).first->second);
+		for (auto group : {&candidate.reused_operands, &candidate.local_fields, &candidate.single_operand})
+			for (const auto &field : *group)
+				for (auto producer : field.producers)
+					connected.merge(member, first_reader.emplace(producer, member).first->second);
 		candidates.push_back(std::move(candidate));
 	}
 
-	auto make_edit = [](const Candidate &candidate, bool include_single_operand, bool reused_only) {
-		ChoiceRewrite edit{candidate.root, &candidate.choice, {}};
+	enum class Fields { All, AllWithSingleOperand, ReusedOnly, ReusedWithSingleOperand };
+	auto make_edit = [&](const Candidate &candidate, Fields fields) {
+		ChoiceRewrite edit{index.module->cell(candidate.root), &candidate.branches, {}};
+		if (!edit.root)
+			return edit;
 		pool<int> occupied;
-		if (include_single_operand)
+		if (fields == Fields::AllWithSingleOperand || fields == Fields::ReusedWithSingleOperand)
 			for (const auto &field : candidate.single_operand) {
 				edit.fields.push_back(&field);
 				occupied.insert(field.offsets.begin(), field.offsets.end());
 			}
-		int count = reused_only ? candidate.reused : GetSize(candidate.fields);
-		for (int i = 0; i < count; ++i) {
-			const auto &field = candidate.fields[i];
-			if (std::none_of(field.offsets.begin(), field.offsets.end(), [&](int offset) { return occupied.count(offset); }))
-				edit.fields.push_back(&field);
-		}
+		auto get_field = [](const auto &field) -> const auto & { return field; };
+		select_fields(candidate.reused_operands, get_field, occupied, edit.fields);
+		if (fields == Fields::All || fields == Fields::AllWithSingleOperand)
+			select_fields(candidate.local_fields, get_field, occupied, edit.fields);
 		return edit;
 	};
-	int rewrites = 0;
-	pool<int> visited;
-	pool<Cell *> grouped;
+	dict<int, int> group_slots;
+	std::vector<std::vector<int>> groups;
 	for (int i = 0; i < GetSize(candidates); ++i) {
-		if (!visited.insert(i).second)
-			continue;
-		std::vector<int> group{i};
-		for (int j = 0; j < GetSize(group); ++j)
-			for (auto producer : candidates[group[j]].region)
-				if (grouped.insert(producer).second)
-					for (int reader : readers.at(producer))
-						if (visited.insert(reader).second)
-							group.push_back(reader);
-
-		auto apply_group = [&](bool include_single_operand) {
+		auto [slot, inserted] = group_slots.emplace(connected.find(i), GetSize(groups));
+		if (inserted)
+			groups.emplace_back();
+		groups[slot->second].push_back(i);
+	}
+	int rewrites = 0;
+	for (const auto &group : groups) {
+		auto apply_group = [&](Fields fields) {
 			std::vector<ChoiceRewrite> edits;
 			for (int member : group) {
-				auto edit = make_edit(candidates[member], include_single_operand, false);
+				auto edit = make_edit(candidates[member], fields);
 				if (!edit.fields.empty())
 					edits.push_back(std::move(edit));
 			}
@@ -743,41 +582,30 @@ int factor_joint_choices(PmuxCoarseIndex &index)
 		bool has_single_operand = std::any_of(group.begin(), group.end(), [&](int member) {
 			return !candidates[member].single_operand.empty();
 		});
-		if ((has_single_operand && apply_group(true)) || apply_group(false)) {
+		if ((has_single_operand && apply_group(Fields::AllWithSingleOperand)) || apply_group(Fields::All)) {
 			++rewrites;
 			continue;
 		}
 		for (int member : group) {
 			const auto &candidate = candidates[member];
-			auto edit = make_edit(candidate, true, true);
+			auto edit = make_edit(candidate, Fields::ReusedWithSingleOperand);
 			if (edit.fields.empty())
 				continue;
 			if (apply_factor(index, {edit}, "factor joint choices", true)) {
 				++rewrites;
 				continue;
 			}
-			if (!candidate.single_operand.empty() && candidate.reused != 0)
-				rewrites += apply_factor(index, {make_edit(candidate, false, true)}, "factor joint choices", true);
+			if (!candidate.single_operand.empty() && !candidate.reused_operands.empty())
+				rewrites += apply_factor(index, {make_edit(candidate, Fields::ReusedOnly)}, "factor joint choices", true);
 		}
 	}
 	return rewrites;
 }
 
-bool reduction_type(IdString type)
-{
-	return type.in(ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor));
-}
+using Reduction = std::pair<IdString, SigSpec>;
+using ReductionResults = std::map<Reduction, std::vector<IdString>>;
 
-struct ReducedValue
-{
-	IdString type;
-	SigSpec input;
-
-	bool operator==(const ReducedValue &other) const { return type == other.type && input == other.input; }
-	bool operator<(const ReducedValue &other) const { return std::tie(type, input) < std::tie(other.type, other.input); }
-};
-
-std::optional<ReducedValue> normalize_reduction(IdString type, const SigSpec &input)
+std::optional<Reduction> normalize_reduction(IdString type, const SigSpec &input)
 {
 	if (type == ID($reduce_bool))
 		type = ID($reduce_or);
@@ -795,120 +623,119 @@ std::optional<ReducedValue> normalize_reduction(IdString type, const SigSpec &in
 		if (bit != State::S0 && bit != State::S1)
 			return std::nullopt;
 		if (!parity && (bit == State::S1) != and_gate)
-			return ReducedValue{IdString(), bit};
+			return Reduction{IdString(), bit};
 		invert ^= parity && bit == State::S1;
 	}
 	if (remaining.empty())
-		return ReducedValue{IdString(), SigSpec(and_gate || invert ? State::S1 : State::S0)};
+		return Reduction{IdString(), SigSpec(and_gate || invert ? State::S1 : State::S0)};
 	SigSpec operands;
 	for (SigBit bit : remaining)
 		operands.append(bit);
 	if (GetSize(operands) == 1)
-		return ReducedValue{invert ? ID($not) : IdString(), operands};
+		return Reduction{invert ? ID($not) : IdString(), operands};
 	if (parity)
 		type = invert ? ID($reduce_xnor) : ID($reduce_xor);
-	return ReducedValue{type, operands};
+	return Reduction{type, operands};
 }
-
-using ReductionResults = std::map<ReducedValue, std::vector<IdString>>;
 
 void record_reduction(PmuxCoarseIndex &index, Cell *cell, ReductionResults &available)
 {
 	if (GetSize(cell->getPort(ID::Y)) != 1)
 		return;
 	auto input = index.port(cell, ID::A);
-	if (cell->type == ID($not)) {
-		if (GetSize(input) == 1)
-			available[{ID($not), input}].push_back(cell->name);
+	if (cell->type == ID($not) && GetSize(input) != 1)
 		return;
-	}
-	auto value = normalize_reduction(cell->type, input);
-	if (!value || value->type.empty())
+	auto value = cell->type == ID($not) ? std::optional<Reduction>{{cell->type, input}} : normalize_reduction(cell->type, input);
+	if (!value || value->first.empty())
 		return;
 	if (cell->type.in(ID($reduce_xor), ID($reduce_xnor))) {
-		int wire_bits = 0;
-		for (SigBit bit : input)
-			wire_bits += bit.wire != nullptr;
 		// 被抵消的重复位在原单元中仍可能传播未定义值。
-		if (wire_bits != GetSize(value->input))
+		if (std::count_if(input.begin(), input.end(), [](SigBit bit) { return bit.wire; }) != GetSize(value->second))
 			return;
 	}
 	available[*value].push_back(cell->name);
-}
-
-std::optional<SigSpec> find_reduction(PmuxCoarseIndex &index, Cell *root, const ReducedValue &value,
-		const ReductionResults &available)
-{
-	auto found = available.find(value);
-	if (found == available.end())
-		return std::nullopt;
-	pool<SigBit> outputs{index.port(root, ID::Y).as_bit()};
-	for (auto name : found->second) {
-		auto cell = index.module->cell(name);
-		if (!cell || cell == root)
-			continue;
-		auto output = index.port(cell, ID::Y);
-		auto bit = output.as_bit();
-		if (index.driver(bit) == cell && index.independent({bit}, outputs))
-			return output;
-	}
-	return std::nullopt;
 }
 
 bool factor_reduction(PmuxCoarseIndex &index, Cell *root, ReductionResults &available)
 {
 	if (!index.editable(root) || GetSize(index.port(root, ID::Y)) != 1)
 		return false;
-	auto source = choice_input(index, index.port(root, ID::A));
-	if (!source)
+	auto input = index.port(root, ID::A);
+	auto mux = input.empty() ? nullptr : index.driver(input[0]);
+	if (!mux || !pmux_has_selection_port(mux, ID::S) || mux->getPort(ID::S).empty())
 		return false;
-	auto &[mux, choice] = *source;
-
-	std::set<ReducedValue> unique;
-	std::vector<ReducedValue> values;
-	for (const auto &branch : choice.branches) {
-		if (unspecified(branch)) {
-			values.push_back({IdString(), SigSpec(State::Sx)});
+	std::vector<int> offsets;
+	for (auto bit : input) {
+		auto source = index.source(bit);
+		if (!source || source->cell != mux || source->port != ID::Y)
+			return false;
+		offsets.push_back(source->offset);
+	}
+	std::map<Reduction, SigSpec> results;
+	std::vector<Reduction> values;
+	for (const auto &arm : choice_branches(index, mux)) {
+		SigSpec branch;
+		for (int offset : offsets)
+			branch.append(arm[offset]);
+		if (branch.is_fully_const() && branch.as_const().is_fully_undef_x_only()) {
+			values.emplace_back(IdString(), State::Sx);
 			continue;
 		}
 		auto value = normalize_reduction(root->type, branch);
 		if (!value)
 			return false;
 		values.push_back(*value);
-		unique.insert(*value);
+		results.try_emplace(*value);
 	}
-	if (unique.empty())
+	if (results.empty())
 		return false;
 
 	PmuxRewrite candidate(index.module, index, "factor reduction");
-	std::map<ReducedValue, SigSpec> results;
+	pool<SigBit> outputs{index.port(root, ID::Y).as_bit()};
 	std::vector<IdString> added;
-	for (const auto &value : unique) {
-		if (value.type.empty()) {
-			results[value] = value.input;
+	for (auto &[value, result] : results) {
+		const auto &[type, input] = value;
+		if (type.empty()) {
+			result = input;
 			continue;
 		}
-		if (auto result = find_reduction(index, root, value, available)) {
-			results[value] = *result;
+		if (auto found = available.find(value); found != available.end())
+			for (auto name : found->second) {
+				auto cell = index.module->cell(name);
+				if (!cell || cell == root)
+					continue;
+				auto bit = index.port(cell, ID::Y).as_bit();
+				if (index.driver(bit) == cell && index.independent({bit}, outputs)) {
+					result = bit;
+					break;
+				}
+			}
+		if (!result.empty())
 			continue;
+		auto &staging = candidate.staging;
+		result = staging.addWire(NEW_ID);
+		auto name = NEW_ID;
+		auto src = root->get_src_attribute();
+		if (type == ID($not))
+			staging.addNot(name, input, result, false, src);
+		else if (type == ID($reduce_and))
+			staging.addReduceAnd(name, input, result, false, src);
+		else if (type == ID($reduce_or))
+			staging.addReduceOr(name, input, result, false, src);
+		else if (type == ID($reduce_xor))
+			staging.addReduceXor(name, input, result, false, src);
+		else {
+			log_assert(type == ID($reduce_xnor));
+			staging.addReduceXnor(name, input, result, false, src);
 		}
-		Wire *wire = candidate.staging.addWire(NEW_ID);
-		Cell *reduction = candidate.staging.addCell(NEW_ID, value.type);
-		reduction->setParam(ID::A_WIDTH, GetSize(value.input));
-		reduction->setParam(ID::A_SIGNED, false);
-		reduction->setParam(ID::Y_WIDTH, 1);
-		reduction->setPort(ID::A, value.input);
-		reduction->setPort(ID::Y, wire);
-		results[value] = wire;
-		added.push_back(reduction->name);
+		added.push_back(name);
 	}
 	std::vector<SigSpec> branches;
 	for (const auto &value : values)
-		branches.push_back(unspecified(value.input) ? value.input : results.at(value));
-	auto common = common_value(branches);
-	candidate.connect(root->getPort(ID::Y), common ? *common : emit_choice(&candidate.staging, choice.select, branches));
-	if (!prepare_factor(index, {root}, {root, mux}, candidate) ||
-			((!added.empty() || !common) && !candidate.removed.count(mux)) || !candidate.validate())
+		branches.push_back(value.first.empty() ? value.second : results.at(value));
+	candidate.connect(root->getPort(ID::Y), build_choice(&candidate.staging, index.port(mux, ID::S), branches));
+	candidate.find_removable({root, mux});
+	if (!candidate.removed.count(root) || (candidate.added_count() && !candidate.removed.count(mux)) || !candidate.validate())
 		return false;
 	candidate.commit();
 	for (auto name : added)
@@ -919,17 +746,15 @@ bool factor_reduction(PmuxCoarseIndex &index, Cell *root, ReductionResults &avai
 int factor_reductions(PmuxCoarseIndex &index)
 {
 	std::vector<IdString> reductions;
-	for (auto cell : index.module->selected_cells())
-		if (reduction_type(cell->type))
-			reductions.push_back(cell->name);
-	if (reductions.empty())
-		return 0;
-	std::sort(reductions.begin(), reductions.end());
-
 	ReductionResults available;
-	for (auto cell : index.module->cells())
-		if (reduction_type(cell->type) || cell->type == ID($not))
+	for (auto cell : index.module->cells()) {
+		bool reduction = cell->type.in(ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor));
+		if (reduction && index.module->design->selected(index.module, cell))
+			reductions.push_back(cell->name);
+		if (reduction || cell->type == ID($not))
 			record_reduction(index, cell, available);
+	}
+	std::sort(reductions.begin(), reductions.end());
 	for (auto &[value, names] : available)
 		std::sort(names.begin(), names.end());
 
@@ -958,20 +783,13 @@ struct OptPmuxFactorPass : public Pass
 
 	void execute(std::vector<std::string> args, Design *design) override
 	{
-		log_header(design, "Executing OPT_PMUX_FACTOR pass.\n");
 		extra_args(args, 1, design);
-		if (pmux_coarse_observes_undef(design))
-			return;
-		for (Module *module : design->selected_modules()) {
-			if (module->has_processes_warn())
-				continue;
+		pmux_run_pass(design, "opt_pmux_factor", "Executing OPT_PMUX_FACTOR pass.\n", [](Module *module) {
 			PmuxCoarseIndex index(module);
 			int rewrites = factor_reductions(index);
 			rewrites += factor_joint_choices(index);
-			rewrites += factor_local_choices(index);
-			if (rewrites)
-				design->scratchpad_set_bool("opt.did_something", true);
-		}
+			return rewrites + factor_local_choices(index);
+		});
 	}
 } OptPmuxFactorPass;
 

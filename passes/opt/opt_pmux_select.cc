@@ -11,13 +11,21 @@ PRIVATE_NAMESPACE_BEGIN
 struct SelectNetwork
 {
 	Cell *cell;
-	SigSpec a, b, y;
+	SigSpec a, b, select, y;
 	std::vector<int> branches;
+
+	SelectNetwork(PmuxCoarseIndex &index, Cell *cell) : cell(cell),
+		a(index.port(cell, ID::A)), b(index.port(cell, ID::B)), select(index.port(cell, ID::S)),
+		y(index.port(cell, ID::Y)) {}
+
+	int arms() const { return GetSize(select) + 1; }
 
 	SigBit data(int branch, int offset) const
 	{
-		return branch < 0 ? a[offset] : b[branch * GetSize(y) + offset];
+		return branch == 0 ? a[offset] : b[(branch - 1) * GetSize(y) + offset];
 	}
+
+	SigBit encoded_data(int code, int offset) const { return data(branches[code], offset); }
 };
 
 class SelectWorker
@@ -25,14 +33,30 @@ class SelectWorker
 	Module *module;
 	PmuxCoarseIndex index;
 
-	bool collect_removable(PmuxRewrite &rewrite, const pool<Cell *> &replaced, pool<Cell *> candidates,
-			const SigSpec &output, const pool<SigBit> &inputs)
+	struct SelectorAnalysis {
+		PmuxEncoding encoding;
+		std::vector<int> branches;
+
+		SelectorAnalysis(PmuxCoarseIndex &index, const SigSpec &select) :
+			encoding(index)
+		{
+			encoding.branch_table(select, branches);
+		}
+	};
+	dict<SigSpec, std::unique_ptr<SelectorAnalysis>> selectors;
+
+	const SelectorAnalysis &decode_selector(const SigSpec &select)
 	{
-		pool<SigBit> outputs;
-		for (auto bit : index.sigmap(output))
-			outputs.insert(bit);
+		auto &analysis = selectors[select];
+		if (!analysis)
+			analysis = std::make_unique<SelectorAnalysis>(index, select);
+		return *analysis;
+	}
+
+	bool collect_removable(PmuxRewrite &rewrite, const pool<Cell *> &replaced, pool<Cell *> candidates)
+	{
 		candidates.insert(replaced.begin(), replaced.end());
-		rewrite.find_removable(candidates, replaced, outputs, inputs);
+		rewrite.find_removable(candidates, replaced);
 		return std::all_of(replaced.begin(), replaced.end(), [&](auto cell) { return rewrite.removed.count(cell); });
 	}
 
@@ -62,24 +86,24 @@ class SelectWorker
 				continue;
 
 			PmuxSelectTree tree(index, encoding);
-			std::vector<int> controls(GetSize(encoding.controls)), roots;
+			std::vector<int> controls(GetSize(encoding.controls())), roots, rows(tables[1].size());
 			std::iota(controls.begin(), controls.end(), 0);
-			SelectNetwork network{inner, index.port(inner, ID::A), index.port(inner, ID::B), inner_output, std::move(tables[0])};
+			SelectNetwork network(index, inner);
+			network.branches = std::move(tables[0]);
 			// 未知控制下，选择树会合并所有兼容编码的原始数据位。
 			for (int offset = 0; offset < GetSize(output); ++offset) {
-				std::vector<int> rows;
-				for (int code = 0; code < GetSize(network.branches); ++code) {
-					bool use_inner = (tables[1][code] == 0) == (arm == ID::B);
-					rows.push_back(tree.literal(use_inner ? network.data(network.branches[code], offset) : bypass[offset]));
+				for (int code = 0; code < GetSize(rows); ++code) {
+					bool use_inner = (tables[1][code] == 1) == (arm == ID::B);
+					rows[code] = tree.literal(use_inner ? network.encoded_data(code, offset) : bypass[offset]);
 				}
-				roots.push_back(tree.column(std::move(rows), controls));
+				roots.push_back(tree.column(rows, controls));
 			}
 			auto live = tree.analyze(roots);
 			if (live.mux_bits >= GetSize(output) * (GetSize(inner_select) + 1))
 				continue;
 			PmuxRewrite rewrite(module, index, "merge_select_wrapper");
 			rewrite.connect(output, tree.emit(&rewrite.staging, roots, outer->get_src_attribute(), live));
-			if (!collect_removable(rewrite, replaced, encoding.cells, output, tree.inputs(live)) ||
+			if (!collect_removable(rewrite, replaced, encoding.cells()) ||
 					GetSize(rewrite.removed) <= rewrite.added_count() || !rewrite.validate())
 				continue;
 			rewrite.commit();
@@ -102,12 +126,11 @@ class SelectWorker
 
 	std::unique_ptr<PmuxRewrite> reduce_fields(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding)
 	{
-		if (encoding.controls.size() < 2 || std::none_of(networks.begin(), networks.end(), [](const auto &network) {
-				return network.cell->type == ID($pmux);
-			}))
+		if (encoding.controls().size() < 2 || std::none_of(networks.begin(), networks.end(),
+				[](const auto &network) { return network.cell->type == ID($pmux); }))
 			return nullptr;
 		std::vector<PmuxPartialCode> partial_codes;
-		unsigned full_mask = (1u << encoding.controls.size()) - 1;
+		unsigned full_mask = (1u << encoding.controls().size()) - 1;
 
 		struct ReducedField {
 			SigSpec output;
@@ -116,94 +139,75 @@ class SelectWorker
 		std::map<unsigned, ReducedField> fields;
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "reduce_selection_fields");
 		pool<Cell *> replaced;
-		pool<SigBit> inputs;
-		SigSpec output;
 		int saved_terms = 0;
-		auto retain = [&](const SigSpec &signal) { inputs.insert(signal.begin(), signal.end()); };
 		for (const auto &network : networks) {
 			if (network.cell->type != ID($pmux))
 				continue;
-			SigSpec select = index.port(network.cell, ID::S);
+			const auto &select = network.select;
 			std::vector<unsigned> unknown_by_branch;
 			auto parallel_safe = [&](unsigned mask, int offset) {
 				if (unknown_by_branch.empty()) {
-					auto branches = encoding.partial_branches({network.cell});
-					unknown_by_branch.resize(GetSize(select) + 1, branches.empty() ? full_mask : 0);
-					if (!branches.empty()) {
-						if (partial_codes.empty())
-							partial_codes = encoding.partial_codes();
-						const auto &choices = branches.front();
-						for (int row = 0; row < GetSize(choices); ++row) {
-							int branch = choices[row].first;
-							if (branch != -2)
-								unknown_by_branch[branch + 1] |= full_mask & ~(partial_codes[row].zero | partial_codes[row].one);
-						}
-					}
+					auto choices = encoding.partial_branches({network.cell}).front();
+					if (partial_codes.empty())
+						partial_codes = encoding.partial_codes();
+					unknown_by_branch.resize(network.arms());
+					for (int row = 0; row < GetSize(choices); ++row)
+						if (choices[row].kind == BranchKind::Selected)
+							unknown_by_branch[choices[row].index] |= full_mask & ~(partial_codes[row].zero | partial_codes[row].one);
 				}
 				// 并行译码在未知控制下可能输出 X，原分支的已定义数据必须保留。
 				for (int branch = 0; branch < GetSize(unknown_by_branch); ++branch)
-					if ((unknown_by_branch[branch] & mask) && network.data(branch - 1, offset) != State::Sx)
+					if ((unknown_by_branch[branch] & mask) && network.data(branch, offset) != State::Sx)
 						return false;
 				return true;
 			};
 
 			SigSpec remaining_output;
-			std::vector<SigSpec> remaining(GetSize(select) + 1);
+			std::vector<SigSpec> remaining(network.arms());
 			std::vector<SigBit> rows(network.branches.size());
 			for (int offset = 0; offset < GetSize(network.y); ++offset) {
 				for (int code = 0; code < GetSize(rows); ++code)
-					rows[code] = network.data(network.branches[code], offset);
+					rows[code] = network.encoded_data(code, offset);
 				unsigned mask = data_support(rows);
-				int controls = std::popcount(mask), reduced_branches = (1 << controls) - 1;
-				bool reduces_terms = mask != full_mask && reduced_branches < GetSize(select) && (controls <= 1 || parallel_safe(mask, offset));
-				if (!reduces_terms) {
+				int controls = std::popcount(mask), terms = pmux_encoding_limit(controls) - 1;
+				if (mask == full_mask || terms >= GetSize(select) || (controls > 1 && !parallel_safe(mask, offset))) {
 					remaining_output.append(network.y[offset]);
 					for (int branch = 0; branch < GetSize(remaining); ++branch)
-						remaining[branch].append(network.data(branch - 1, offset));
+						remaining[branch].append(network.data(branch, offset));
 					continue;
 				}
 
 				auto &field = fields[mask];
 				field.output.append(network.y[offset]);
-				field.data.resize(reduced_branches + 1);
+				field.data.resize(terms + 1);
 				int reduced_code = 0;
 				for (unsigned code = 0; code < rows.size(); ++code)
 					if (!(code & ~mask))
 						field.data[reduced_code++].append(rows[code]);
-				saved_terms += GetSize(select) - reduced_branches;
+				saved_terms += GetSize(select) - terms;
 			}
 			if (remaining_output == network.y)
 				continue;
 			replaced.insert(network.cell);
-			output.append(network.y);
 			if (!remaining_output.empty()) {
 				SigSpec data;
 				for (int branch = 1; branch < GetSize(remaining); ++branch)
 					data.append(remaining[branch]);
-				retain(remaining.front());
-				retain(data);
-				retain(select);
 				rewrite->staging.addPmux(NEW_ID, remaining.front(), data, select, remaining_output, network.cell->get_src_attribute());
 			}
 		}
-		if (fields.empty())
-			return nullptr;
-		int decoder_bits = 0;
 		for (const auto &[mask, field] : fields)
 			if (std::popcount(mask) > 1)
-				decoder_bits += std::popcount(mask) * (GetSize(field.data) - 1);
-		if (saved_terms <= decoder_bits)
+				saved_terms -= std::popcount(mask) * (GetSize(field.data) - 1);
+		if (saved_terms <= 0)
 			return nullptr;
 
 		const std::string src = networks.front().cell->get_src_attribute();
 		for (const auto &[mask, field] : fields) {
-			for (const auto &row : field.data)
-				retain(row);
 			SigSpec controls;
-			for (int slot = 0; slot < GetSize(encoding.controls); ++slot)
+			for (int slot = 0; slot < GetSize(encoding.controls()); ++slot)
 				if (mask & (1u << slot))
-					controls.append(encoding.controls[slot]);
-			retain(controls);
+					controls.append(encoding.controls()[slot]);
 			if (controls.empty()) {
 				rewrite->connect(field.output, field.data.front());
 			} else if (GetSize(controls) == 1) {
@@ -218,7 +222,7 @@ class SelectWorker
 				rewrite->staging.addPmux(NEW_ID, field.data.front(), data, selects, field.output, src);
 			}
 		}
-		if (!collect_removable(*rewrite, replaced, encoding.cells, output, inputs) || !rewrite->validate())
+		if (!collect_removable(*rewrite, replaced, encoding.cells()) || !rewrite->validate())
 			return nullptr;
 		return rewrite;
 	}
@@ -226,70 +230,71 @@ class SelectWorker
 	std::unique_ptr<PmuxRewrite> rebuild(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding, bool specialize)
 	{
 		PmuxSelectTree tree(index, encoding);
-		std::vector<int> controls(GetSize(encoding.controls)), roots, reversed_roots;
+		int control_count = GetSize(encoding.controls());
+		std::vector<int> controls(control_count);
 		std::iota(controls.begin(), controls.end(), 0);
-		std::vector<int> reversed_controls(controls.rbegin(), controls.rend()), reversed_codes;
-		if (GetSize(controls) > 1) {
-			for (int code = 0; code < (1 << GetSize(controls)); ++code) {
-				int reversed_code = 0;
-				for (int control : controls)
-					reversed_code = (reversed_code << 1) | ((code >> control) & 1);
-				reversed_codes.push_back(reversed_code);
-			}
-		}
+		auto reversed_controls = controls;
+		std::reverse(reversed_controls.begin(), reversed_controls.end());
+		bool try_reverse = control_count > 1;
+		std::vector<int> reversed_codes(try_reverse ? pmux_encoding_limit(control_count) : 0);
+		for (int code = 0; code < GetSize(reversed_codes); ++code)
+			for (int control : controls)
+				reversed_codes[code] = (reversed_codes[code] << 1) | ((code >> control) & 1);
+
+		std::array<std::vector<int>, 2> roots;
+		auto append_column = [&](std::vector<int> values, bool reverse) {
+			if (reverse)
+				for (int row = 0; row < GetSize(values); ++row)
+					if (row < reversed_codes[row])
+						std::swap(values[row], values[reversed_codes[row]]);
+			roots[reverse].push_back(tree.column(std::move(values), reverse ? reversed_controls : controls));
+		};
 		SigSpec output;
 		pool<Cell *> replaced;
 		bool all_single = true, direct_column = false;
 		for (const auto &network : networks) {
-			all_single &= GetSize(network.cell->getPort(ID::S)) == 1;
+			all_single &= GetSize(network.select) == 1;
 			replaced.insert(network.cell);
 			output.append(network.y);
 			for (int offset = 0; offset < GetSize(network.y); ++offset) {
-				std::vector<int> rows;
-				for (int code = 0; code < GetSize(network.branches); ++code) {
-					SigBit bit = network.data(network.branches[code], offset);
-					auto slot = encoding.slots.find(bit);
-					if (slot != encoding.slots.end())
-						rows.push_back(tree.literal(code & (1 << slot->second) ? State::S1 : State::S0));
+				std::vector<int> rows(network.branches.size());
+				for (int code = 0; code < GetSize(rows); ++code) {
+					SigBit bit = network.encoded_data(code, offset);
+					if (auto slot = encoding.slots().find(bit); slot != encoding.slots().end())
+						rows[code] = tree.literal(code & (1 << slot->second) ? State::S1 : State::S0);
 					else
-						rows.push_back(specialize ? tree.fold(bit, code) : tree.literal(bit));
+						rows[code] = specialize ? tree.fold(bit, code) : tree.literal(bit);
 				}
 				direct_column |= std::all_of(rows.begin(), rows.end(), [&](int row) { return row == rows.front(); });
-				if (!reversed_codes.empty()) {
-					std::vector<int> reversed_rows;
-					reversed_rows.reserve(rows.size());
-					for (int code : reversed_codes)
-						reversed_rows.push_back(rows[code]);
-					reversed_roots.push_back(tree.column(std::move(reversed_rows), reversed_controls));
-				}
-				roots.push_back(tree.column(std::move(rows), controls));
+				if (try_reverse)
+					append_column(rows, true);
+				append_column(std::move(rows), false);
 			}
 		}
-		pool<Cell *> candidates = encoding.cells;
+		pool<Cell *> candidates = encoding.cells();
 		candidates.insert(tree.producers.begin(), tree.producers.end());
-		auto build_candidate = [&](const std::vector<int> &values, const PmuxSelectTree::Analysis &live, const char *rule) -> std::unique_ptr<PmuxRewrite> {
+		const char *rules[2][2] = {
+			{"rebuild_decode", "rebuild_decode_reverse"},
+			{"specialize_decoded_data", "specialize_decoded_data_reverse"},
+		};
+		auto build_candidate = [&](bool reverse, const PmuxSelectTree::Analysis &live) -> std::unique_ptr<PmuxRewrite> {
 			if (all_single && live.mux_bits >= GetSize(output))
 				return nullptr;
-			auto rewrite = std::make_unique<PmuxRewrite>(module, index, rule);
-			if (!collect_removable(*rewrite, replaced, candidates, output, tree.inputs(live)))
-				return nullptr;
-			if (!all_single && !direct_column && std::all_of(rewrite->removed.begin(), rewrite->removed.end(),
-					[&](auto cell) { return replaced.count(cell); }))
-				return nullptr;
-			rewrite->connect(output, tree.emit(&rewrite->staging, values, networks.front().cell->get_src_attribute(), live));
-			if (!rewrite->validate())
+			auto rewrite = std::make_unique<PmuxRewrite>(module, index, rules[specialize][reverse]);
+			rewrite->connect(output, tree.emit(&rewrite->staging, roots[reverse], networks.front().cell->get_src_attribute(), live));
+			if (!collect_removable(*rewrite, replaced, candidates) ||
+					(!all_single && !direct_column && rewrite->removed.size() == replaced.size()) || !rewrite->validate())
 				return nullptr;
 			return rewrite;
 		};
-		auto live = tree.analyze(roots);
-		auto forward = build_candidate(roots, live, specialize ? "specialize_decoded_data" : "rebuild_decode");
-		if (reversed_roots.empty() || reversed_roots == roots)
+		auto live = tree.analyze(roots[false]);
+		auto forward = build_candidate(false, live);
+		if (!try_reverse || roots[true] == roots[false])
 			return forward;
-		auto reversed_live = tree.analyze(reversed_roots);
+		auto reversed_live = tree.analyze(roots[true]);
 		if (forward && reversed_live.mux_bits > live.mux_bits)
 			return forward;
-		auto reverse = build_candidate(reversed_roots, reversed_live,
-				specialize ? "specialize_decoded_data_reverse" : "rebuild_decode_reverse");
+		auto reverse = build_candidate(true, reversed_live);
 		auto rank = [](const PmuxRewrite &rewrite, int count) {
 			return std::pair{count, rewrite.added_count() - GetSize(rewrite.removed)};
 		};
@@ -300,88 +305,92 @@ class SelectWorker
 
 	dict<Cell *, std::array<bool, 2>> foldable_mux_arms(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding)
 	{
+		std::vector<const SelectNetwork *> muxes;
 		std::vector<Cell *> cells;
-		std::vector<uint64_t> active_codes;
 		for (const auto &network : networks) {
-			if (network.cell->type != ID($mux))
-				continue;
-			cells.push_back(network.cell);
-			uint64_t codes = 0;
-			for (int code = 0; code < GetSize(network.branches); ++code)
-				if (network.branches[code] == 0)
-					codes |= uint64_t(1) << code;
-			active_codes.push_back(codes);
+			if (network.cell->type == ID($mux)) {
+				muxes.push_back(&network);
+				cells.push_back(network.cell);
+			}
 		}
 
 		auto choices = encoding.partial_branches(cells);
-		dict<Cell *, std::array<bool, 2>> foldable;
-		for (auto cell : cells)
-			foldable.emplace(cell, std::array{!choices.empty(), !choices.empty()});
-		if (choices.empty())
-			return foldable;
 		const auto partial_codes = encoding.partial_codes();
+		unsigned row_count = pmux_encoding_limit(GetSize(encoding.controls()));
+		std::vector<uint64_t> completions(partial_codes.size());
 		for (int row = 0; row < GetSize(partial_codes); ++row) {
-			const auto &partial = partial_codes[row];
-			unsigned fixed = partial.zero | partial.one;
-			if (fixed == (1u << GetSize(encoding.controls)) - 1)
-				continue;
-			uint64_t completions = 0;
-			for (unsigned code = partial.one; code < (1u << GetSize(encoding.controls)); ++code)
-				if ((code & fixed) == partial.one)
-					completions |= uint64_t(1) << code;
-			for (int i = 0; i < GetSize(cells); ++i) {
-				if (choices[i][row].second == -2)
-					continue;
-				// 未知选择会合并两路数据。只在该路有兼容的完整编码时采用特化值。
-				auto &arms = foldable.at(cells[i]);
-				arms[0] &= (completions & ~active_codes[i]) != 0;
-				arms[1] &= (completions & active_codes[i]) != 0;
-			}
+			const auto &[zero, one] = partial_codes[row];
+			unsigned fixed = zero | one;
+			for (unsigned code = one; code < row_count; ++code)
+				if ((code & fixed) == one)
+					completions[row] |= uint64_t(1) << code;
+		}
+		dict<Cell *, std::array<bool, 2>> foldable;
+		for (int i = 0; i < GetSize(cells); ++i) {
+			uint64_t active = 0;
+			for (unsigned code = 0; code < row_count; ++code)
+				if (muxes[i]->branches[code] == 1)
+					active |= uint64_t(1) << code;
+			std::array arms{true, true};
+			// An unknown selector merges both arms. Each arm needs a compatible complete code.
+			for (int row = 0; row < GetSize(completions); ++row)
+				if (choices[i][row].kind == BranchKind::Dynamic) {
+					arms[0] &= (completions[row] & ~active) != 0;
+					arms[1] &= (completions[row] & active) != 0;
+				}
+			foldable.emplace(cells[i], arms);
 		}
 		return foldable;
 	}
 
-	std::unique_ptr<PmuxRewrite> keep_decode(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding)
+	std::unique_ptr<PmuxRewrite> keep_decode(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding, bool shared)
 	{
 		struct FieldPlan {
 			Cell *cell;
 			SigSpec output, direct_output;
-			int first, width;
+			int first;
+		};
+		struct BranchChoice {
+			enum class Kind { unreachable, fixed, dynamic } kind = Kind::unreachable;
+			int value = 0;
+
+			void include(int next)
+			{
+				if (kind == Kind::unreachable)
+					*this = {Kind::fixed, next};
+				else if (value != next)
+					kind = Kind::dynamic;
+			}
 		};
 		PmuxSelectTree tree(index, encoding);
 		std::vector<FieldPlan> plans;
 		std::vector<int> roots;
 		pool<Cell *> replaced;
-		pool<SigBit> select_inputs;
-		SigSpec outputs;
 		std::optional<dict<Cell *, std::array<bool, 2>>> foldable;
 		for (const auto &network : networks) {
-			auto select = index.port(network.cell, ID::S);
-			int branches = GetSize(select) + 1;
-			std::vector<std::vector<int>> by_branch(branches);
+			std::vector<std::vector<int>> by_branch(network.arms());
 			std::vector<int> direct;
 			SigSpec y, direct_y;
 			bool changed = false;
+			std::vector<BranchChoice> common(network.arms());
 			for (int offset = 0; offset < GetSize(network.y); ++offset) {
-				// -1 表示不可达，-2 表示同一分支的多个编码对应不同数据。
-				std::vector<int> common(branches, -1);
-				int constant_column = -1;
+				std::fill(common.begin(), common.end(), BranchChoice{});
+				BranchChoice column;
 				for (int code = 0; code < GetSize(network.branches); ++code) {
 					int branch = network.branches[code];
 					int value = tree.fold(network.data(branch, offset), code);
-					int &same = common[branch + 1];
-					same = same == -1 || same == value ? value : -2;
-					constant_column = constant_column == -1 || constant_column == value ? value : -2;
+					common[branch].include(value);
+					column.include(value);
 				}
-				if (constant_column >= 0) {
-					direct.push_back(constant_column);
+				if (column.kind == BranchChoice::Kind::fixed) {
+					direct.push_back(column.value);
 					direct_y.append(network.y[offset]);
 					changed = true;
 					continue;
 				}
-				for (int row = 0; row < branches; ++row) {
-					int original = tree.literal(network.data(row - 1, offset));
-					int value = common[row] < 0 ? original : common[row];
+				for (int row = 0; row < GetSize(common); ++row) {
+					int original = tree.literal(network.data(row, offset));
+					int value = common[row].kind == BranchChoice::Kind::fixed ? common[row].value : original;
 					if (value != original && network.cell->type == ID($mux)) {
 						if (!foldable)
 							foldable = foldable_mux_arms(networks, encoding);
@@ -395,26 +404,23 @@ class SelectWorker
 			}
 			if (!changed)
 				continue;
-			plans.push_back({network.cell, y, direct_y, GetSize(roots), GetSize(y)});
+			plans.push_back({network.cell, y, direct_y, GetSize(roots)});
 			for (const auto &branch : by_branch)
 				roots.insert(roots.end(), branch.begin(), branch.end());
 			roots.insert(roots.end(), direct.begin(), direct.end());
-			if (!y.empty())
-				select_inputs.insert(select.begin(), select.end());
 			replaced.insert(network.cell);
-			outputs.append(network.y);
 		}
-		if (plans.empty())
+		if (replaced.empty())
 			return nullptr;
 		auto live = tree.analyze(roots);
-		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "specialize_shared_decode");
+		auto rewrite = std::make_unique<PmuxRewrite>(module, index, shared ? "specialize_shared_decode" : "specialize_dedicated_decode");
 		SigSpec data = tree.emit(&rewrite->staging, roots, networks.front().cell->get_src_attribute(), live);
 		for (const auto &plan : plans) {
 			auto select = index.port(plan.cell, ID::S);
-			int branch_data = plan.width * GetSize(select);
-			if (plan.width) {
-				auto a = data.extract(plan.first, plan.width);
-				auto b = data.extract(plan.first + plan.width, branch_data);
+			int width = GetSize(plan.output), branch_data = width * GetSize(select);
+			if (width) {
+				auto a = data.extract(plan.first, width);
+				auto b = data.extract(plan.first + width, branch_data);
 				auto src = plan.cell->get_src_attribute();
 				if (plan.cell->type == ID($mux))
 					rewrite->staging.addMux(NEW_ID, a, b, select, plan.output, src);
@@ -422,165 +428,112 @@ class SelectWorker
 					rewrite->staging.addPmux(NEW_ID, a, b, select, plan.output, src);
 			}
 			if (!plan.direct_output.empty())
-				rewrite->connect(plan.direct_output, data.extract(plan.first + plan.width + branch_data, GetSize(plan.direct_output)));
+				rewrite->connect(plan.direct_output, data.extract(plan.first + width + branch_data, GetSize(plan.direct_output)));
 		}
-		auto inputs = tree.inputs(live);
-		inputs.insert(select_inputs.begin(), select_inputs.end());
-		pool<Cell *> candidates = encoding.cells;
+		pool<Cell *> candidates = encoding.cells();
 		candidates.insert(tree.producers.begin(), tree.producers.end());
-		if (!collect_removable(*rewrite, replaced, std::move(candidates), outputs, inputs) || !rewrite->validate())
+		if (!collect_removable(*rewrite, replaced, std::move(candidates)) ||
+				(!shared && GetSize(rewrite->removed) <= rewrite->added_count()) || !rewrite->validate())
 			return nullptr;
 		return rewrite;
 	}
 
-	struct GroupAnalysis {
-		PmuxEncoding encoding;
-		std::vector<SelectNetwork> networks;
-		std::optional<bool> shared_decode;
-
-		explicit GroupAnalysis(const PmuxCoarseIndex &index) : encoding(index) {}
-	};
-
-	std::unique_ptr<PmuxRewrite> specialize_data(GroupAnalysis &group, bool shared_decode)
+	std::vector<IdString> selected_names() const
 	{
-		if (!group.shared_decode) {
-			pool<Cell *> selections;
-			for (const auto &network : group.networks)
-				selections.insert(network.cell);
-			group.shared_decode = index.removable(group.encoding.cells, selections, {}, {}) != group.encoding.cells;
-		}
-		return *group.shared_decode == shared_decode ? keep_decode(group.networks, group.encoding) : nullptr;
-	}
-
-	std::vector<Cell *> selected_cells(bool pmux_only) const
-	{
-		auto cells = module->selected_cells();
-		if (pmux_only)
-			std::erase_if(cells, [](auto cell) { return cell->type != ID($pmux); });
-		std::sort(cells.begin(), cells.end(), [](auto a, auto b) { return a->name < b->name; });
-		return cells;
-	}
-
-	bool analyze_group(const std::vector<IdString> &names, bool pmux_only, GroupAnalysis &group)
-	{
-		std::vector<SigSpec> selectors;
-		int width = 0;
-		for (auto name : names) {
-			auto cell = module->cell(name);
-			if (!cell || !pmux_select_shape(cell) || !index.editable(cell) || (pmux_only && cell->type != ID($pmux)))
-				continue;
-			auto y = index.port(cell, ID::Y);
-			width += GetSize(y);
-			selectors.push_back(index.port(cell, ID::S));
-			group.networks.push_back({cell, index.port(cell, ID::A), index.port(cell, ID::B), y, {}});
-		}
-		if (group.networks.empty())
-			return false;
-		std::vector<std::vector<int>> tables;
-		if (!group.encoding.branch_tables(selectors, tables) || width > pmux_max_table_bits / GetSize(tables.front()))
-			return false;
-		for (int i = 0; i < GetSize(group.networks); ++i)
-			group.networks[i].branches = std::move(tables[i]);
-		return true;
-	}
-
-	void commit_group(PmuxRewrite &rewrite, std::vector<IdString> &names, bool pmux_only, bool retain_choices)
-	{
-		if (retain_choices)
-			for (auto cell : rewrite.staging.cells())
-				if (cell->type == ID($pmux) || (!pmux_only && cell->type == ID($mux)))
-					names.push_back(cell->name);
-		rewrite.commit();
-		std::erase_if(names, [&](IdString name) { return !module->cell(name); });
+		std::vector<IdString> names;
+		for (auto cell : module->selected_cells())
+			if (pmux_select_shape(cell))
+				names.push_back(cell->name);
 		std::sort(names.begin(), names.end());
-		names.erase(std::unique(names.begin(), names.end()), names.end());
+		return names;
 	}
 
-	int merge_wrappers()
+	template<typename Key>
+	std::vector<std::vector<IdString>> group_networks(const std::vector<IdString> &names, Key &&key)
 	{
-		std::vector<IdString> wrappers;
-		for (auto cell : selected_cells(false))
-			if (cell->type == ID($mux))
-				wrappers.push_back(cell->name);
-		int rewrites = 0;
-		for (auto name : wrappers)
+		dict<SigSpec, int> positions;
+		std::vector<std::vector<IdString>> groups;
+		for (auto name : names)
 			if (auto cell = module->cell(name))
-				rewrites += merge_wrapper(cell);
-		return rewrites;
-	}
-
-	dict<SigSpec, std::vector<IdString>> group_networks(const std::vector<Cell *> &cells)
-	{
-		dict<SigSpec, std::vector<IdString>> groups;
-		for (auto cell : cells) {
-			if (!pmux_select_shape(cell) || !index.editable(cell))
-				continue;
-			PmuxEncoding encoding(index);
-			std::vector<int> branches;
-			if (encoding.branch_table(index.port(cell, ID::S), branches))
-				groups[pmux_control_key(encoding)].push_back(cell->name);
-		}
+				if (auto value = key(cell)) {
+					auto [position, inserted] = positions.emplace(std::move(*value), GetSize(groups));
+					if (inserted)
+						groups.emplace_back();
+					groups[position->second].push_back(name);
+				}
+		std::reverse(groups.begin(), groups.end());
 		return groups;
 	}
 
 	int rewrite_network(std::vector<IdString> names, bool pmux_only)
 	{
+		enum class Rule { reduce, shared, specialize, rebuild_raw, dedicated };
+		const std::array rules{Rule::reduce, Rule::shared, Rule::specialize, Rule::rebuild_raw, Rule::dedicated};
+		int next_rule = 0;
 		int rewrites = 0;
-		std::optional<GroupAnalysis> group;
-		auto apply = [&](bool retain_choices, auto build) {
-			if (!group) {
-				group.emplace(index);
-				if (!analyze_group(names, pmux_only, *group))
-					group->networks.clear();
-			}
-			if (group->networks.empty())
-				return;
-			auto rewrite = build(*group);
-			if (!rewrite)
-				return;
-			commit_group(*rewrite, names, pmux_only, retain_choices);
-			group.reset();
-			++rewrites;
-		};
-		apply(true, [&](const auto &group) {
-			return reduce_fields(group.networks, group.encoding);
-		});
-		apply(false, [&](auto &group) {
-			return specialize_data(group, true);
-		});
-		apply(false, [&](const auto &group) {
-			return rebuild(group.networks, group.encoding, true);
-		});
-		apply(false, [&](const auto &group) {
-			return rebuild(group.networks, group.encoding, false);
-		});
-		apply(false, [&](auto &group) {
-			return specialize_data(group, false);
-		});
-		return rewrites;
-	}
-
-	int rewrite_networks(bool pmux_only)
-	{
-		int rewrites = 0;
-		auto apply = [&](const std::vector<IdString> &names) {
-			int changes = rewrite_network(names, pmux_only);
-			rewrites += changes;
-			return changes != 0;
-		};
-		auto groups = group_networks(selected_cells(pmux_only));
-		for (const auto &[control, names] : groups) {
-			if (apply(names) || GetSize(names) == 1)
-				continue;
-			dict<SigSpec, std::vector<IdString>> selectors;
-			for (auto name : names)
-				if (auto cell = module->cell(name))
-					selectors[index.port(cell, ID::S)].push_back(name);
-			for (const auto &[select, subset] : selectors) {
-				if (GetSize(subset) > 1 && GetSize(subset) < GetSize(names) && apply(subset))
+		while (next_rule < GetSize(rules)) {
+			std::vector<SelectNetwork> networks;
+			std::vector<SigSpec> select_signals;
+			pool<Cell *> selection_cells;
+			int width = 0;
+			for (auto name : names) {
+				auto cell = module->cell(name);
+				if (!cell || !pmux_select_shape(cell) || !index.editable(cell) || (pmux_only && cell->type != ID($pmux)))
 					continue;
-				for (auto name : subset)
-					apply({name});
+				const auto &network = networks.emplace_back(index, cell);
+				select_signals.push_back(network.select);
+				selection_cells.insert(cell);
+				width += GetSize(network.y);
+			}
+			if (networks.empty())
+				break;
+			const auto &initial = decode_selector(select_signals.front());
+			if (initial.branches.empty())
+				break;
+			const PmuxEncoding *encoding = &initial.encoding;
+			std::optional<PmuxEncoding> combined;
+			if (std::all_of(select_signals.begin(), select_signals.end(), [&](const auto &select) { return select == select_signals.front(); })) {
+				for (auto &network : networks)
+					network.branches = initial.branches;
+			} else {
+				combined.emplace(initial.encoding);
+				encoding = &*combined;
+				std::vector<std::vector<int>> tables;
+				if (!combined->branch_tables(select_signals, tables))
+					break;
+				for (int i = 0; i < GetSize(networks); ++i)
+					networks[i].branches = std::move(tables[i]);
+			}
+			if (width > pmux_max_table_bits / GetSize(networks.front().branches))
+				break;
+
+			std::optional<bool> shared_decode;
+			while (next_rule < GetSize(rules)) {
+				std::unique_ptr<PmuxRewrite> rewrite;
+				auto rule = rules[next_rule++];
+				if (rule == Rule::reduce) {
+					rewrite = reduce_fields(networks, *encoding);
+				} else if (rule == Rule::shared || rule == Rule::dedicated) {
+					if (!shared_decode)
+						shared_decode = index.removable(encoding->cells(), selection_cells, {}, {}) != encoding->cells();
+					if (*shared_decode == (rule == Rule::shared))
+						rewrite = keep_decode(networks, *encoding, *shared_decode);
+				} else {
+					rewrite = rebuild(networks, *encoding, rule == Rule::specialize);
+				}
+				if (!rewrite)
+					continue;
+				if (rule == Rule::reduce) {
+					for (auto cell : rewrite->staging.cells())
+						if (cell->type == ID($pmux) || (!pmux_only && cell->type == ID($mux)))
+							names.push_back(cell->name);
+					std::sort(names.begin(), names.end());
+					names.erase(std::unique(names.begin(), names.end()), names.end());
+				}
+				rewrite->commit();
+				selectors.clear();
+				++rewrites;
+				break;
 			}
 		}
 		return rewrites;
@@ -589,12 +542,39 @@ class SelectWorker
 public:
 	explicit SelectWorker(Module *module) : module(module), index(module) {}
 
-	std::pair<int, int> run(bool pmux_only)
+	int run(bool pmux_only)
 	{
-		int before = module->cells_size();
-		int rewrites = pmux_only ? 0 : merge_wrappers();
-		rewrites += rewrite_networks(pmux_only);
-		return {rewrites, module->cells_size() - before};
+		int rewrites = 0;
+		if (!pmux_only)
+			for (auto name : selected_names())
+				if (auto cell = module->cell(name))
+					rewrites += merge_wrapper(cell);
+		auto groups = group_networks(selected_names(), [&](Cell *cell) -> std::optional<SigSpec> {
+			if ((pmux_only && cell->type != ID($pmux)) || !index.editable(cell))
+				return std::nullopt;
+			const auto &analysis = decode_selector(index.port(cell, ID::S));
+			if (analysis.branches.empty())
+				return std::nullopt;
+			return analysis.encoding.control_key();
+		});
+		auto apply = [&](const std::vector<IdString> &names) {
+			int changes = rewrite_network(names, pmux_only);
+			rewrites += changes;
+			return changes != 0;
+		};
+		for (const auto &names : groups) {
+			if (apply(names) || GetSize(names) == 1)
+				continue;
+			for (const auto &subset : group_networks(names, [&](Cell *cell) {
+				return std::optional(index.port(cell, ID::S));
+			})) {
+				if (GetSize(subset) > 1 && GetSize(subset) < GetSize(names) && apply(subset))
+					continue;
+				for (auto name : subset)
+					apply({name});
+			}
+		}
+		return rewrites;
 	}
 };
 
@@ -611,20 +591,10 @@ struct OptPmuxSelectPass : Pass
 
 	void execute(std::vector<std::string> args, Design *design) override
 	{
-		log_header(design, "Executing OPT_PMUX_SELECT pass (rebuild selection networks).\n");
 		bool pmux_only = args.size() > 1 && args[1] == "-pmux-only";
 		extra_args(args, pmux_only ? 2 : 1, design);
-		if (pmux_coarse_observes_undef(design))
-			return;
-		int rewrites = 0, cell_change = 0;
-		for (auto module : design->selected_modules()) {
-			if (module->has_processes())
-				continue;
-			auto [count, delta] = SelectWorker(module).run(pmux_only);
-			rewrites += count;
-			cell_change += delta;
-		}
-		log("Rebuilt %d selection networks (net RTLIL cell change: %+d).\n", rewrites, cell_change);
+		pmux_run_pass(design, "opt_pmux_select", "Executing OPT_PMUX_SELECT pass (rebuild selection networks).\n",
+			[&](Module *module) { return SelectWorker(module).run(pmux_only); });
 	}
 } OptPmuxSelectPass;
 

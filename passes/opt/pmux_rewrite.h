@@ -8,7 +8,7 @@ YOSYS_NAMESPACE_BEGIN
 class PmuxRewrite
 {
 	Module *module;
-	const PmuxCoarseIndex &index;
+	PmuxCoarseIndex &index;
 	const char *rule;
 	bool validated = false;
 	pool<Cell *> removed_cells;
@@ -24,113 +24,77 @@ class PmuxRewrite
 		return bit.wire && bit.wire->module == module ? index.sigmap(bit) : bit;
 	}
 
-	struct CandidateDriver {
-		Cell *cell;
-		SigBit alias;
-	};
-
-	bool independent_bit(SigBit bit, const dict<SigBit, CandidateDriver> &drivers,
-			pool<SigBit> &inputs, pool<SigBit> &active, pool<SigBit> &checked,
-			pool<Cell *> &checked_cells, pool<Cell *> &active_cells) const
+	bool staged_boundary(pool<SigBit> &outputs, pool<SigBit> &retained, PmuxCoarseIndex::Drivers &drivers)
 	{
-		bit = canonical(bit);
-		if (!bit.wire || checked.count(bit))
-			return true;
-		if (!active.insert(bit).second)
-			return false;
-
-		auto driver = drivers.find(bit);
-		if (driver == drivers.end()) {
-			if (bit.wire->module != module)
+		auto add_driver = [&](SigBit bit, PmuxCoarseIndex::Driver driver) {
+			bit = canonical(bit);
+			if (!bit.wire)
 				return false;
-			inputs.insert(bit);
-		} else if (auto cell = driver->second.cell) {
-			if (!checked_cells.count(cell)) {
-				if (!active_cells.insert(cell).second)
-					return false;
-				for (const auto &[name, signal] : cell->connections()) {
-					if (cell->port_dir(name) != RTLIL::PD_INPUT || !PmuxCoarseIndex::combinational_input(cell->type, name))
-						continue;
-					for (auto input : signal)
-						if (!independent_bit(input, drivers, inputs, active, checked, checked_cells, active_cells))
-							return false;
+			log_assert(bit.wire->module == module || bit.wire->module == &staging);
+			if (!drivers.emplace(bit, driver).second)
+				return false;
+			if (bit.wire->module == module)
+				outputs.insert(bit);
+			return true;
+		};
+		auto retain = [&](SigBit bit) {
+			bit = canonical(bit);
+			if (bit.wire && bit.wire->module == module)
+				retained.insert(bit);
+		};
+		for (auto cell : staging.cells()) {
+			for (const auto &[name, signal] : cell->connections()) {
+				auto direction = cell->port_dir(name);
+				log_assert(direction == RTLIL::PD_INPUT || direction == RTLIL::PD_OUTPUT);
+				for (auto bit : signal) {
+					if (direction == RTLIL::PD_INPUT)
+						retain(bit);
+					else if (!add_driver(bit, {cell, SigBit()}))
+						return false;
 				}
-				active_cells.erase(cell);
-				checked_cells.insert(cell);
 			}
-		} else if (!independent_bit(driver->second.alias, drivers, inputs, active, checked, checked_cells, active_cells)) {
-			return false;
 		}
-
-		active.erase(bit);
-		checked.insert(bit);
+		for (const auto &[lhs, rhs] : staging.connections()) {
+			for (int i = 0; i < GetSize(lhs); ++i) {
+				if (!add_driver(lhs[i], {nullptr, rhs[i]}))
+					return false;
+				retain(rhs[i]);
+			}
+		}
+		for (auto bit : outputs)
+			retained.erase(bit);
 		return true;
 	}
 
 	bool check_removal()
 	{
 		pool<SigBit> outputs, retained;
-		dict<SigBit, CandidateDriver> drivers;
-		auto add_driver = [&](SigBit bit, CandidateDriver driver) {
-			bit = canonical(bit);
-			if (!bit.wire || !drivers.emplace(bit, driver).second)
-				return false;
-			if (bit.wire->module == &staging)
-				return true;
-			if (bit.wire->module != module)
-				return false;
+		PmuxCoarseIndex::Drivers drivers;
+		if (!staged_boundary(outputs, retained, drivers))
+			return false;
+		for (auto bit : outputs) {
 			auto old = index.source(bit);
 			if (!old || !removed.count(old->cell))
 				return false;
-			outputs.insert(bit);
-			return true;
-		};
-		auto retain = [&](SigBit bit) {
-			bit = canonical(bit);
-			if (bit.wire && bit.wire->module == module && !outputs.count(bit))
-				retained.insert(bit);
-		};
-		for (auto cell : staging.cells())
-			for (const auto &[name, signal] : cell->connections()) {
-				auto direction = cell->port_dir(name);
-				if (direction == RTLIL::PD_INPUT)
-					continue;
-				if (direction != RTLIL::PD_OUTPUT)
-					return false;
-				for (auto bit : signal)
-					if (!add_driver(bit, {cell, SigBit()}))
-						return false;
-			}
-		for (const auto &[lhs, rhs] : staging.connections())
-			for (int i = 0; i < GetSize(lhs); ++i)
-				if (!add_driver(lhs[i], {nullptr, rhs[i]}))
-					return false;
-		for (auto cell : staging.cells())
-			for (const auto &[name, signal] : cell->connections())
-				if (cell->port_dir(name) == RTLIL::PD_INPUT)
-					for (auto bit : signal)
-						retain(bit);
-		for (const auto &connection : staging.connections())
-			for (auto bit : connection.second)
-				retain(bit);
+		}
 
-		bool checked_removal = removal_boundary && removal_boundary->revision == index.index.revision &&
+		bool checked_removal = removal_boundary && removal_boundary->revision == index.revision() &&
 				removal_boundary->outputs == outputs && removal_boundary->inputs == retained;
-		if (!checked_removal && !index.all_removable(removed, outputs, retained))
+		if (!checked_removal && !std::all_of(removed.begin(), removed.end(), [&](Cell *cell) {
+				return index.can_remove(cell, removed, {}, outputs, retained);
+			}))
 			return false;
-		pool<SigBit> inputs, active, checked;
-		pool<Cell *> checked_cells, active_cells;
-		for (auto bit : outputs)
-			if (!independent_bit(bit, drivers, inputs, active, checked, checked_cells, active_cells))
-				return false;
-		return index.independent(inputs, outputs);
+		return index.independent_rewrite(outputs, drivers);
 	}
 
 public:
 	Module staging;
 	const pool<Cell *> &removed = removed_cells;
 
-	PmuxRewrite(Module *module, const PmuxCoarseIndex &index, const char *rule) : module(module), index(index), rule(rule) {}
+	PmuxRewrite(Module *module, PmuxCoarseIndex &index, const char *rule) : module(module), index(index), rule(rule)
+	{
+		log_assert(module == index.module && module->design);
+	}
 	PmuxRewrite(const PmuxRewrite &) = delete;
 	PmuxRewrite &operator=(const PmuxRewrite &) = delete;
 
@@ -138,12 +102,24 @@ public:
 			const pool<SigBit> &outputs, const pool<SigBit> &inputs)
 	{
 		log_assert(!validated);
-		RemovalBoundary boundary{index.normalize_bits(outputs), index.normalize_bits(inputs), index.index.revision};
+		RemovalBoundary boundary{index.normalize_bits(outputs), index.normalize_bits(inputs), index.revision()};
 		removed_cells = index.removable_normalized(candidates, replaced_users, boundary.outputs, boundary.inputs);
 		removal_boundary.reset();
 		// 只有已删除的使用者才可在最终验证时忽略。
 		if (std::all_of(replaced_users.begin(), replaced_users.end(), [&](auto cell) { return removed.count(cell); }))
 			removal_boundary.emplace(std::move(boundary));
+	}
+	void find_removable(const pool<Cell *> &candidates, const pool<Cell *> &replaced_users = {}, const pool<SigBit> &outputs = {})
+	{
+		log_assert(!validated);
+		pool<SigBit> staged_outputs, retained;
+		PmuxCoarseIndex::Drivers drivers;
+		if (!staged_boundary(staged_outputs, retained, drivers)) {
+			removed_cells.clear();
+			removal_boundary.reset();
+			return;
+		}
+		find_removable(candidates, replaced_users, outputs.empty() ? staged_outputs : outputs, retained);
 	}
 
 	void connect(const SigSpec &lhs, const SigSpec &rhs) { staging.connect(lhs, rhs); }
@@ -173,6 +149,8 @@ public:
 			}
 			return result;
 		};
+		auto design = module->design;
+		bool inherit_selection = !removed.empty() && !design->selected_whole_module(module->name);
 		for (auto cell : removed)
 			module->remove(cell);
 		for (auto cell : staging.cells()) {
@@ -181,6 +159,8 @@ public:
 			replacement->parameters = cell->parameters;
 			for (const auto &[name, signal] : cell->connections())
 				replacement->setPort(name, remap(signal));
+			if (inherit_selection)
+				design->select(module, replacement);
 		}
 		for (const auto &[lhs, rhs] : staging.connections())
 			module->connect(remap(lhs), remap(rhs));

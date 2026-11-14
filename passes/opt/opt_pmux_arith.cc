@@ -1,12 +1,14 @@
 #include "kernel/celltypes.h"
 #include "kernel/log.h"
 #include "kernel/register.h"
+#include "pmux_common.h"
 #include "pmux_rewrite.h"
 
 #include <algorithm>
 #include <array>
 #include <map>
 #include <memory>
+#include <ranges>
 #include <set>
 
 USING_YOSYS_NAMESPACE
@@ -37,7 +39,7 @@ bool arithmetic_type(IdString type)
 	return type.in(ID($add), ID($sub), ID($neg));
 }
 
-SigSpec trim_zero_extension(SigSpec value)
+SigSpec trim_zero_extension(const SigSpec &value)
 {
 	int width = GetSize(value);
 	while (width > 1 && value[width - 1] == State::S0)
@@ -45,65 +47,61 @@ SigSpec trim_zero_extension(SigSpec value)
 	return value.extract(0, width);
 }
 
-struct BinaryArithmeticInputs
+std::vector<SigSpec> arithmetic_arms(PmuxCoarseIndex &index, Cell *cell, int width, int count)
 {
-	PmuxCoarseIndex &index;
-	bool external_inputs;
-	int remaining = 65536;
-	pool<Cell *> active;
-	dict<Cell *, bool> checked;
-
-	BinaryArithmeticInputs(PmuxCoarseIndex &index, bool external_inputs) : index(index), external_inputs(external_inputs) {}
-
-	bool check(const SigSpec &value, int depth = 0)
-	{
-		if (depth > 128)
-			return false;
-		for (SigBit bit : value) {
-			if (--remaining < 0)
-				return false;
-			if (!bit.wire) {
-				if (bit != State::S0 && bit != State::S1)
-					return false;
-				continue;
-			}
-			Cell *driver = index.driver(bit);
-			if (driver ? !check_driver(driver, depth) : !(external_inputs && index.module_input(bit)))
-				return false;
-		}
-		return true;
-	}
-
-	bool check_driver(Cell *cell, int depth)
-	{
-		if (checked.count(cell))
-			return checked.at(cell);
-		if (!cell->type.in(ID($add), ID($sub), ID($neg), ID($mul), ID($not), ID($and), ID($or), ID($xor), ID($xnor),
-				ID($eq), ID($ne), ID($lt), ID($le), ID($gt), ID($ge), ID($logic_not), ID($logic_and), ID($logic_or),
-				ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor),
-				ID($mux), ID($slice), ID($concat)) || !active.insert(cell).second)
-			return false;
-		bool defined = true;
-		for (const auto &[name, input] : cell->connections())
-			if (cell->input(name) && !check(index.sigmap(input), depth + 1)) {
-				defined = false;
-				break;
-			}
-		active.erase(cell);
-		checked[cell] = defined;
-		return defined;
-	}
-};
+	auto data = index.port(cell, ID::B);
+	int branch_width = GetSize(cell->getPort(ID::Y));
+	std::vector<SigSpec> arms{index.port(cell, ID::A)};
+	log_assert(GetSize(arms.front()) == branch_width && int64_t{branch_width} * count == GetSize(data));
+	arms.front() = arms.front().extract(0, width);
+	for (int i = 0; i < count; i++)
+		arms.push_back(data.extract(i * branch_width, width));
+	return arms;
+}
 
 struct ArithmeticRewrite
 {
 	PmuxCoarseIndex &index;
 	int width;
+	bool external_inputs, has_selector;
 	int remaining = 2048;
+	int binary_remaining = 65536;
 	pool<Cell *> region;
-	bool full_width_result = false;
+	pool<Cell *> binary_cells, active;
 
-	ArithmeticRewrite(PmuxCoarseIndex &index, int width) : index(index), width(width) {}
+	ArithmeticRewrite(PmuxCoarseIndex &index, int width, bool external_inputs, bool has_selector)
+			: index(index), width(width), external_inputs(external_inputs), has_selector(has_selector) {}
+
+	bool binary(const SigSpec &value, int depth = 0)
+	{
+		if (depth > 128 || (binary_remaining -= GetSize(value)) < 0)
+			return false;
+		for (SigBit bit : value) {
+			if (!bit.wire) {
+				if (bit != State::S0 && bit != State::S1)
+					return false;
+				continue;
+			}
+			auto cell = index.driver(bit);
+			if (!cell && (!external_inputs || !index.module_input(bit)))
+				return false;
+			if (!cell || binary_cells.count(cell))
+				continue;
+			if (!cell->type.in(ID($add), ID($sub), ID($neg), ID($mul), ID($not), ID($and), ID($or), ID($xor), ID($xnor),
+					ID($eq), ID($ne), ID($lt), ID($le), ID($gt), ID($ge), ID($logic_not), ID($logic_and), ID($logic_or),
+					ID($reduce_and), ID($reduce_or), ID($reduce_bool), ID($reduce_xor), ID($reduce_xnor),
+					ID($mux), ID($slice), ID($concat)) || !active.insert(cell).second)
+				return false;
+			for (const auto &[name, input] : cell->connections())
+				if (cell->input(name) && !binary(index.sigmap(input), depth + 1)) {
+					active.erase(cell);
+					return false;
+				}
+			active.erase(cell);
+			binary_cells.insert(cell);
+		}
+		return true;
+	}
 
 	bool expand(SigSpec value, int sign, ArithmeticExpression &expression, int depth = 0)
 	{
@@ -122,30 +120,26 @@ struct ArithmeticRewrite
 		Cell *driver = index.driver(value[0]);
 		if (driver && arithmetic_type(driver->type) && index.editable(driver)) {
 			SigSpec a = index.port(driver, ID::A);
-			SigSpec b;
-			bool is_signed = driver->getParam(ID::A_SIGNED).as_bool();
-			if (driver->type != ID($neg)) {
-				b = index.port(driver, ID::B);
-				is_signed &= driver->getParam(ID::B_SIGNED).as_bool();
-			}
+			bool unary = driver->type == ID($neg);
+			auto b = unary ? SigSpec() : index.port(driver, ID::B);
+			bool is_signed = pmux_is_signed_port(driver, ID::A) && (unary || pmux_is_signed_port(driver, ID::B));
 			SigSpec output = index.port(driver, ID::Y);
 			const int output_width = GetSize(output);
 			const int compared_width = std::min(output_width, width);
 			bool matches = output.extract(0, compared_width) == value.extract(0, compared_width);
 			if (output_width < width) {
 				// A narrowed result can be widened only when the original operation cannot overflow.
-				bool signed_extension = is_signed;
-				bool zero_extension = !is_signed && driver->type == ID($add);
-				matches &= (signed_extension || zero_extension) && output_width > std::max(GetSize(a), GetSize(b));
-				output.extend_u0(width, signed_extension);
+				matches &= (is_signed || driver->type == ID($add)) && output_width > std::max(GetSize(a), GetSize(b));
+				output.extend_u0(width, is_signed);
 				matches &= output == value;
 			}
 			if (matches) {
-				if (depth == 0)
-					full_width_result = output_width >= width;
+				// A widened branch can retain known bits even when the operation yields X.
+				if (has_selector && depth == 0 && output_width < width && !binary(value))
+					return false;
 				region.insert(driver);
 				a.extend_u0(width, is_signed);
-				if (driver->type == ID($neg))
+				if (unary)
 					return expand(a, -sign, expression, depth + 1);
 				b.extend_u0(width, is_signed);
 				return expand(a, sign, expression, depth + 1) &&
@@ -153,6 +147,8 @@ struct ArithmeticRewrite
 			}
 		}
 
+		if (has_selector && depth == 0 && !binary(value))
+			return false;
 		for (SigBit bit : value)
 			if (!bit.wire && bit != State::S0 && bit != State::S1)
 				return false;
@@ -166,29 +162,26 @@ struct ArithmeticRewrite
 	}
 };
 
-void add_column(ArithmeticPlan &plan, const std::vector<SigSpec> &values, const std::vector<bool> &defined, bool subtract)
+void add_column(ArithmeticPlan &plan, std::vector<SigSpec> values, const std::vector<bool> &defined, bool subtract)
 {
 	int width = 0;
 	for (int i = 0; i < GetSize(values); i++)
 		if (defined[i])
 			width = std::max(width, GetSize(values[i]));
 
-	std::vector<SigSpec> padded;
-	for (auto value : values) {
+	for (auto &value : values)
 		value.extend_u0(width);
-		padded.push_back(std::move(value));
-	}
-
 	int first = std::find(defined.begin(), defined.end(), true) - defined.begin();
-	ArithmeticColumn column{padded[first], {}, {}, subtract};
+	log_assert(first < GetSize(values));
+	ArithmeticColumn column{values[first], {}, {}, subtract};
 	dict<SigSpec, int> lanes;
 	for (int bit = 0; bit < width; bit++) {
 		SigSpec lane;
 		bool common = true;
 		for (int branch = 0; branch < GetSize(values); branch++) {
-			const SigSpec &value = padded[branch];
-			common &= !defined[branch] || value[bit] == column.operand[bit];
-			lane.append(defined[branch] ? value[bit] : SigBit(State::Sx));
+			auto value = values[branch][bit];
+			common &= !defined[branch] || value == column.operand[bit];
+			lane.append(defined[branch] ? value : SigBit(State::Sx));
 		}
 		if (common)
 			continue;
@@ -197,7 +190,8 @@ void add_column(ArithmeticPlan &plan, const std::vector<SigSpec> &values, const 
 		column.varying_bits.emplace_back(bit, slot->second);
 		column.operand[bit] = State::S0;
 		if (inserted) {
-			column.variants.resize(GetSize(values));
+			if (column.variants.empty())
+				column.variants.resize(GetSize(values));
 			for (int branch = 0; branch < GetSize(values); branch++)
 				column.variants[branch].append(lane[branch]);
 		}
@@ -215,7 +209,7 @@ ArithmeticPlan make_term_columns(const std::vector<std::vector<SigSpec>> &terms,
 		std::vector<SigSpec> values;
 		for (const auto &branch : terms)
 			values.push_back(column < GetSize(branch) ? branch[column] : SigSpec(State::S0));
-		add_column(plan, values, defined, subtract);
+		add_column(plan, std::move(values), defined, subtract);
 	}
 	return plan;
 }
@@ -231,14 +225,15 @@ std::pair<int, int> selected_width(const ArithmeticPlan &plan)
 	return {bits, cells};
 }
 
-void improve_three_term_columns(ArithmeticPlan &best, std::vector<std::vector<SigSpec>> &terms, const std::vector<bool> &defined)
+void improve_term_columns(ArithmeticPlan &best, std::vector<std::vector<SigSpec>> &terms,
+		const std::vector<bool> &defined, int columns)
 {
 	std::vector<int> branches;
 	int width = 0;
 	for (int i = 0; i < GetSize(terms); i++) {
 		if (!defined[i])
 			continue;
-		if (GetSize(terms[i]) != 3 || GetSize(branches) == 4)
+		if (GetSize(terms[i]) != columns || GetSize(branches) == 4)
 			return;
 		branches.push_back(i);
 		for (const auto &term : terms[i])
@@ -248,16 +243,17 @@ void improve_three_term_columns(ArithmeticPlan &best, std::vector<std::vector<Si
 		return;
 	int combinations = 1;
 	for (int i = 1; i < GetSize(branches); i++)
-		combinations *= 6;
+		for (int permutation = 2; permutation <= columns; permutation++)
+			combinations *= permutation;
 	constexpr int permutation_work_limit = 1 << 18;
-	if (int64_t{3} * combinations * width * GetSize(terms) > permutation_work_limit)
+	if (int64_t{columns} * combinations * width * GetSize(terms) > permutation_work_limit)
 		return;
 
 	auto best_width = selected_width(best);
-	// 整体交换三列不会改变选择规模，因此固定第一个已定义分支。
+	// Permuting all columns together leaves the selector cost unchanged.
 	auto enumerate = [&](auto &self, int branch) -> void {
 		if (branch == GetSize(branches)) {
-			auto candidate = make_term_columns(terms, defined, 3, false);
+			auto candidate = make_term_columns(terms, defined, columns, false);
 			auto width = selected_width(candidate);
 			if (width < best_width) {
 				best = std::move(candidate);
@@ -276,9 +272,9 @@ void improve_three_term_columns(ArithmeticPlan &best, std::vector<std::vector<Si
 ArithmeticPlan make_column_plan(std::vector<ArithmeticExpression> expressions, const std::vector<bool> &defined)
 {
 	ArithmeticPlan plan;
+	int first = std::find(defined.begin(), defined.end(), true) - defined.begin();
 	for (int sign : {1, -1}) {
 		// Emit common terms before allocating selector inputs to the remaining terms.
-		int first = std::find(defined.begin(), defined.end(), true) - defined.begin();
 		for (auto [term, coefficient] : expressions[first].terms) {
 			int common = coefficient * sign;
 			for (int i = 0; i < GetSize(expressions) && common > 0; i++) {
@@ -305,39 +301,29 @@ ArithmeticPlan make_column_plan(std::vector<ArithmeticExpression> expressions, c
 		}
 		auto columns = make_term_columns(terms, defined, count, sign < 0);
 		if (sign > 0 && count == 3)
-			improve_three_term_columns(columns, terms, defined);
-		for (auto &column : columns)
-			plan.push_back(std::move(column));
+			improve_term_columns(columns, terms, defined, count);
+		std::ranges::move(columns, std::back_inserter(plan));
 	}
 
-	std::vector<SigSpec> offsets;
-	for (auto &expression : expressions)
-		offsets.push_back(trim_zero_extension(expression.offset));
-	add_column(plan, offsets, defined, false);
 	return plan;
 }
 
 ArithmeticPlan make_exclusion_plan(const std::vector<ArithmeticExpression> &expressions, const std::vector<bool> &defined,
-		BinaryArithmeticInputs &binary)
+		ArithmeticRewrite &rewrite)
 {
 	std::set<SigSpec> total;
-	std::vector<SigSpec> offsets;
-	for (int i = 0; i < GetSize(expressions); i++) {
-		offsets.push_back(trim_zero_extension(expressions[i].offset));
-		if (!defined[i])
-			continue;
-		for (auto &[term, coefficient] : expressions[i].terms) {
+	for (const auto &expression : expressions)
+		for (const auto &[term, coefficient] : expression.terms) {
 			if (coefficient != 1)
 				return {};
 			total.insert(term);
 		}
-	}
 	if (GetSize(total) < 3)
 		return {};
 	// The total includes terms unused by individual branches. They must be binary
 	// so an unknown term cannot contaminate a branch that originally omitted it.
 	for (const auto &term : total)
-		if (!binary.check(term))
+		if (!rewrite.binary(term))
 			return {};
 
 	std::vector<SigSpec> excluded(GetSize(expressions), State::S0);
@@ -356,32 +342,8 @@ ArithmeticPlan make_exclusion_plan(const std::vector<ArithmeticExpression> &expr
 	ArithmeticPlan plan;
 	for (const auto &term : total)
 		plan.push_back({term, {}, {}, false});
-	add_column(plan, excluded, defined, true);
-	add_column(plan, offsets, defined, false);
+	add_column(plan, std::move(excluded), defined, true);
 	return plan;
-}
-
-bool prepare_arithmetic_rewrite(PmuxRewrite &candidate, PmuxCoarseIndex &index, Cell *root,
-		const pool<Cell *> &region, const SigSpec &result)
-{
-	pool<SigBit> inputs, outputs;
-	auto record_inputs = [&](const SigSpec &signal) {
-		for (auto bit : signal)
-			if (bit.wire && bit.wire->module == index.module)
-				inputs.insert(bit);
-	};
-	for (auto cell : candidate.staging.cells())
-		for (const auto &[port, signal] : cell->connections())
-			if (cell->input(port))
-				record_inputs(signal);
-	record_inputs(result);
-	for (auto bit : index.port(root, ID::Y))
-		outputs.insert(bit);
-	candidate.find_removable(region, {}, outputs, inputs);
-	if (!candidate.removed.count(root))
-		return false;
-	candidate.connect(root->getPort(ID::Y), result);
-	return true;
 }
 
 struct ExtremumPredicates
@@ -437,7 +399,7 @@ struct ExtremumPredicates
 
 	static bool signed_comparison(Cell *cell)
 	{
-		return cell->getParam(ID::A_SIGNED).as_bool() && cell->getParam(ID::B_SIGNED).as_bool();
+		return pmux_is_signed_port(cell, ID::A) && pmux_is_signed_port(cell, ID::B);
 	}
 
 	ExtremumPredicates(PmuxCoarseIndex &index, Cell *order) : index(index), lhs(index.port(order, ID::A)),
@@ -460,7 +422,7 @@ struct ExtremumPredicates
 			return std::nullopt;
 		a.extend_u0(width, is_signed);
 		b.extend_u0(width, is_signed);
-		// 相等关系允许同时扩展两个已经等宽的操作数。
+		// Extend the equal-width operands together for the equality check.
 		width = std::max(width, GetSize(lhs));
 		a.extend_u0(width, signed_order);
 		b.extend_u0(width, signed_order);
@@ -493,38 +455,35 @@ struct ExtremumPredicates
 		if (!source || source->port != ID::Y || GetSize(source->cell->getPort(ID::Y)) != 1)
 			return std::nullopt;
 		auto cell = source->cell;
-		if (strict_comparison(cell) || cell->type == ID($eq)) {
-			if (auto ordering = relation(cell)) {
-				Values values = {State::S0, State::S0, State::S0, State::Sx, State::Sx};
-				values[*ordering] = State::S1;
-				if (*ordering == equal)
-					values[unknown_different] = State::S0;
-				else
-					strict_selects.emplace_back(*ordering, bit);
-				seen[*ordering] = true;
-				region.insert(cell);
-				evaluated.emplace(bit, values);
-				return values;
-			}
-		}
-		if (!predicate_gate(cell))
-			return std::nullopt;
-		std::array<Const, row_count> a, b;
-		for (auto port : {ID::A, ID::B}) {
-			if (!cell->hasPort(port))
-				continue;
-			auto &operand = port == ID::A ? a : b;
-			for (auto input : index.port(cell, port)) {
-				auto values = evaluate(input, depth + 1);
-				if (!values)
-					return std::nullopt;
-				for (int row = 0; row < row_count; ++row)
-					operand[row].append((*values)[row]);
-			}
-		}
 		Values values;
-		for (int row = 0; row < row_count; ++row)
-			values[row] = CellTypes::eval(cell, a[row], b[row])[0];
+		auto ordering = strict_comparison(cell) || cell->type == ID($eq) ? relation(cell) : std::nullopt;
+		if (ordering) {
+			values = {State::S0, State::S0, State::S0, State::Sx, State::Sx};
+			values[*ordering] = State::S1;
+			if (*ordering == equal)
+				values[unknown_different] = State::S0;
+			else
+				strict_selects.emplace_back(*ordering, bit);
+			seen[*ordering] = true;
+		} else {
+			if (!predicate_gate(cell))
+				return std::nullopt;
+			std::array<Const, row_count> a, b;
+			for (auto port : {ID::A, ID::B}) {
+				if (!cell->hasPort(port))
+					continue;
+				auto &operand = port == ID::A ? a : b;
+				for (auto input : index.port(cell, port)) {
+					auto input_values = evaluate(input, depth + 1);
+					if (!input_values)
+						return std::nullopt;
+					for (int row = 0; row < row_count; ++row)
+						operand[row].append((*input_values)[row]);
+				}
+			}
+			for (int row = 0; row < row_count; ++row)
+				values[row] = CellTypes::eval(cell, a[row], b[row])[0];
+		}
 		region.insert(cell);
 		evaluated.emplace(bit, values);
 		return values;
@@ -568,14 +527,11 @@ bool match_equal_arm(PmuxCoarseIndex &index, const SigSpec &value, const SigSpec
 
 bool rewrite_extremum(PmuxCoarseIndex &index, Cell *root)
 {
-	if (root->type != ID($pmux) || !index.editable(root))
+	if (!index.editable(root))
 		return false;
 	auto select = index.port(root, ID::S);
 	int width = GetSize(root->getPort(ID::Y));
-	if (width == 0 || width > 4096 || select.empty() || GetSize(select) > 16)
-		return false;
-	auto fallback = index.port(root, ID::A), cases = index.port(root, ID::B);
-	if (GetSize(fallback) != width || GetSize(cases) != width * GetSize(select))
+	if (width > 4096 || select.empty() || GetSize(select) > 16)
 		return false;
 
 	Cell *order = ExtremumPredicates::find_order(index, select);
@@ -600,42 +556,53 @@ bool rewrite_extremum(PmuxCoarseIndex &index, Cell *root)
 	if (std::find(predicates.seen.begin(), predicates.seen.end(), false) != predicates.seen.end())
 		return false;
 
+	auto arms = arithmetic_arms(index, root, width, GetSize(select));
 	std::array<SigSpec, 3> selected;
 	for (int row = 0; row < ExtremumPredicates::row_count; ++row) {
 		auto choice = choices[row].as_const();
 		bool binary_row = row < ExtremumPredicates::unknown_different;
-		int branch = -1;
-		if (!choice.is_fully_zero() && !choice.is_onehot(&branch)) {
-			if (binary_row)
-				return false;
-			continue;
+		int branch = 0;
+		if (!choice.is_fully_zero()) {
+			if (!choice.is_onehot(&branch)) {
+				if (binary_row)
+					return false;
+				continue;
+			}
+			branch++;
 		}
-		auto arm = branch < 0 ? fallback : cases.extract(branch * width, width);
+		const auto &arm = arms.at(branch);
 		if (binary_row)
 			selected[row] = arm;
-		// 只有原选择全部未定义时，才能细化未知比较下的输出。
+		// An unknown comparison can be refined only when the original result is entirely X.
 		else if (!arm.is_fully_const() || !arm.as_const().is_fully_undef_x_only())
 			return false;
 	}
 
-	for (bool sign_extend : {predicates.signed_order, false}) {
+	for (bool sign_extend : {true, false}) {
+		if (sign_extend && !predicates.signed_order)
+			continue;
 		auto lhs = predicates.lhs, rhs = predicates.rhs;
 		lhs.extend_u0(width, sign_extend);
 		rhs.extend_u0(width, sign_extend);
 		bool minimum = selected[ExtremumPredicates::less] == lhs && selected[ExtremumPredicates::greater] == rhs;
 		bool maximum = selected[ExtremumPredicates::less] == rhs && selected[ExtremumPredicates::greater] == lhs;
-		if ((!minimum && !maximum) || !match_equal_arm(index, selected[ExtremumPredicates::equal], lhs, rhs, predicates.region))
+		if (!minimum && !maximum)
 			continue;
-		predicates.region.insert(root);
+		auto region = predicates.region;
+		if (!match_equal_arm(index, selected[ExtremumPredicates::equal], lhs, rhs, region))
+			continue;
+		region.insert(root);
 		std::unique_ptr<PmuxRewrite> best;
 		bool best_uses_less = false;
 		for (auto [relation, control] : predicates.strict_selects) {
 			bool uses_less = relation == ExtremumPredicates::less;
 			bool select_lhs = minimum == uses_less;
-			auto candidate = std::make_unique<PmuxRewrite>(index.module, index, "arith-extremum");
-			auto result = candidate->staging.Mux(NEW_ID, select_lhs ? rhs : lhs, select_lhs ? lhs : rhs,
-					control, root->get_src_attribute());
-			if (!prepare_arithmetic_rewrite(*candidate, index, root, predicates.region, result))
+			auto candidate = std::make_unique<PmuxRewrite>(index.module, index, "arith_extremum");
+			auto result = pmux_emit_mux(&candidate->staging, control, select_lhs ? rhs : lhs, select_lhs ? lhs : rhs,
+					root->get_src_attribute());
+			candidate->connect(root->getPort(ID::Y), result);
+			candidate->find_removable(region);
+			if (!candidate->removed.count(root))
 				continue;
 			if (best && std::make_pair(GetSize(candidate->removed), uses_less) <= std::make_pair(GetSize(best->removed), best_uses_less))
 				continue;
@@ -668,7 +635,7 @@ SigSpec emit_arithmetic(Module *module, const ArithmeticPlan &plan, const SigSpe
 				for (int i = 1; i < GetSize(column.variants); i++)
 					cases.append(column.variants[i]);
 				SigSpec selected = GetSize(select) == 1
-					? module->Mux(NEW_ID, column.variants.front(), cases, select)
+					? pmux_emit_mux(module, select, column.variants.front(), cases)
 					: module->Pmux(NEW_ID, column.variants.front(), cases, select);
 				for (auto [bit, slot] : column.varying_bits)
 					operand[bit] = selected[slot];
@@ -694,30 +661,24 @@ enum class ArithmeticTransform { ExcludedTerm, CommonColumns };
 
 bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs, ArithmeticTransform transform)
 {
-	if (!root->type.in(ID($mux), ID($pmux)) && !arithmetic_type(root->type))
-		return false;
-	if (transform == ArithmeticTransform::ExcludedTerm &&
-			(!root->type.in(ID($mux), ID($pmux)) || GetSize(root->getPort(ID::S)) < 2))
-		return false;
+	bool has_selector = root->type.in(ID($mux), ID($pmux));
+	log_assert(has_selector || arithmetic_type(root->type));
+	log_assert(transform != ArithmeticTransform::ExcludedTerm || (has_selector && GetSize(root->getPort(ID::S)) >= 2));
 	if (!index.editable(root))
 		return false;
 	SigSpec output = index.port(root, ID::Y);
 	int width = GetSize(output);
-	ArithmeticRewrite rewrite{index, width};
-	BinaryArithmeticInputs binary{index, external_inputs};
+	ArithmeticRewrite rewrite{index, width, external_inputs, has_selector};
 	SigSpec select;
 	std::vector<SigSpec> branches;
-	if (arithmetic_type(root->type)) {
+	if (!has_selector) {
 		branches.push_back(output);
 	} else {
 		select = index.port(root, ID::S);
-		SigSpec data = index.port(root, ID::B);
 		int count = GetSize(select);
-		if (count == 0 || count > 64 || GetSize(data) / count != width || GetSize(data) % count != 0)
+		if (count == 0 || count > pmux_max_rows)
 			return false;
-		branches.push_back(index.port(root, ID::A));
-		for (int i = 0; i < count; i++)
-			branches.push_back(data.extract(i * width, width));
+		branches = arithmetic_arms(index, root, width, count);
 		if (std::none_of(branches.begin(), branches.end(), [&](const SigSpec &branch) {
 			Cell *driver = branch.empty() ? nullptr : index.driver(branch[0]);
 			return driver && arithmetic_type(driver->type);
@@ -725,56 +686,46 @@ bool rewrite_arithmetic(PmuxCoarseIndex &index, Cell *root, bool external_inputs
 			return false;
 		// A binary mux merges its branches bit by bit for an unknown selector.
 		// Selecting an arithmetic operand before its operation may lose known bits.
-		if (root->type == ID($mux) && !binary.check(select))
+		if (root->type == ID($mux) && !rewrite.binary(select))
 			return false;
 	}
 
 	std::vector<ArithmeticExpression> expressions;
 	std::vector<bool> defined;
 	for (const SigSpec &branch : branches) {
-		if (GetSize(branch) != width)
-			return false;
 		expressions.emplace_back(width);
 		bool unspecified = branch.is_fully_const() && branch.as_const().is_fully_undef_x_only();
 		defined.push_back(!unspecified);
 		if (unspecified)
 			continue;
-		rewrite.full_width_result = false;
 		if (!rewrite.expand(branch, 1, expressions.back()))
-			return false;
-		// Full-width arithmetic is all X when an input is unknown. An unexpanded
-		// or zero-extended branch may still have defined bits in that situation.
-		if (!select.empty() && !rewrite.full_width_result && !binary.check(branch))
 			return false;
 	}
 	if (rewrite.region.empty())
 		return false;
-	if (select.empty() && !expressions.front().simplified && !expressions.front().terms.empty())
+	if (!has_selector && !expressions.front().simplified && !expressions.front().terms.empty())
 		return false;
 	rewrite.region.insert(root);
 
-	auto apply = [&](const ArithmeticPlan &plan, const char *rule) {
-		PmuxRewrite candidate(index.module, index, rule);
-		auto result = emit_arithmetic(&candidate.staging, plan, select, width);
-		if (!prepare_arithmetic_rewrite(candidate, index, root, rewrite.region, result))
-			return false;
-		// 保留外部仍在使用的生产者，并确认本次重建能消除旧算术。
-		if (candidate.added_count() && std::none_of(candidate.removed.begin(), candidate.removed.end(), [&](Cell *cell) {
-				return cell != root && arithmetic_type(cell->type);
-			}))
-			return false;
-		if (!candidate.validate())
-			return false;
-		log("  Rewriting arithmetic at %s.%s (%d cells removed, %d added).\n",
-			log_id(index.module), log_id(root), GetSize(candidate.removed), candidate.added_count());
-		candidate.commit();
-		return true;
-	};
-	if (transform == ArithmeticTransform::ExcludedTerm) {
-		ArithmeticPlan exclusion = make_exclusion_plan(expressions, defined, binary);
-		return !exclusion.empty() && apply(exclusion, "arith-excluded-term");
-	}
-	return apply(make_column_plan(expressions, defined), "arith-common-columns");
+	bool exclusion = transform == ArithmeticTransform::ExcludedTerm;
+	auto plan = exclusion ? make_exclusion_plan(expressions, defined, rewrite) : make_column_plan(expressions, defined);
+	if (exclusion && plan.empty())
+		return false;
+	std::vector<SigSpec> offsets;
+	for (const auto &expression : expressions)
+		offsets.push_back(trim_zero_extension(expression.offset));
+	add_column(plan, std::move(offsets), defined, false);
+
+	PmuxRewrite candidate(index.module, index, exclusion ? "arith_excluded_term" : "arith_common_columns");
+	auto result = emit_arithmetic(&candidate.staging, plan, select, width);
+	candidate.connect(root->getPort(ID::Y), result);
+	candidate.find_removable(rewrite.region);
+	if (!candidate.removed.count(root) || candidate.added_count() >= GetSize(candidate.removed) || !candidate.validate())
+		return false;
+	log("  Rewriting arithmetic at %s.%s (%d cells removed, %d added).\n",
+		log_id(index.module), log_id(root), GetSize(candidate.removed), candidate.added_count());
+	candidate.commit();
+	return true;
 }
 
 struct ModuloRelation
@@ -789,7 +740,7 @@ struct ModuloTrace
 {
 	PmuxCoarseIndex &index;
 	const Const modulus;
-	int power_of_two = -1;
+	std::optional<int> power_of_two;
 	int remaining = 4096;
 	pool<Cell *> active;
 
@@ -817,20 +768,19 @@ struct ModuloTrace
 			return relations;
 
 		Cell *driver = index.driver(signal[0]);
-		if (driver && driver->type.in(ID($add), ID($pos), ID($mux), ID($pmux)) && index.editable(driver)) {
-			SigSpec output = index.port(driver, ID::Y);
-			if (GetSize(output) >= width && output.extract(0, width) == signal) {
-				if (!active.insert(driver).second)
-					return {};
-				auto expanded = driver->type.in(ID($add), ID($pos))
-					? trace_offset(driver, width, depth)
-					: trace_selection(driver, width, GetSize(output), depth);
-				active.erase(driver);
-				for (auto &relation : expanded) {
-					relation.region.insert(driver);
-					relations.push_back(std::move(relation));
-				}
-			}
+		if (!driver || !driver->type.in(ID($add), ID($pos), ID($mux), ID($pmux)) || !index.editable(driver))
+			return relations;
+		auto output = index.port(driver, ID::Y);
+		if (GetSize(output) < width || output.extract(0, width) != signal)
+			return relations;
+		if (!active.insert(driver).second)
+			return {};
+		auto expanded = driver->type.in(ID($add), ID($pos))
+			? trace_offset(driver, width, depth) : trace_selection(driver, width, depth);
+		active.erase(driver);
+		for (auto &relation : expanded) {
+			relation.region.insert(driver);
+			relations.push_back(std::move(relation));
 		}
 		return relations;
 	}
@@ -838,7 +788,7 @@ struct ModuloTrace
 	std::vector<ModuloRelation> trace_offset(Cell *driver, int width, int depth)
 	{
 		bool unary = driver->type == ID($pos);
-		if (driver->getParam(ID::A_SIGNED).as_bool() && (unary || driver->getParam(ID::B_SIGNED).as_bool()))
+		if (pmux_is_signed_port(driver, ID::A) && (unary || pmux_is_signed_port(driver, ID::B)))
 			return {};
 		SigSpec base = index.port(driver, ID::A);
 		if (unary)
@@ -852,7 +802,7 @@ struct ModuloTrace
 		Const capacity(State::S0, width + 1);
 		capacity.set(width, State::S1);
 		Const increment = offset.as_const();
-		bool wrap_preserves_residue = power_of_two >= 0 && power_of_two <= width;
+		bool wrap_preserves_residue = power_of_two && *power_of_two <= width;
 		std::vector<ModuloRelation> relations;
 		for (auto &relation : trace(base, depth + 1)) {
 			int calc_width = std::max({width, GetSize(increment), GetSize(modulus), GetSize(relation.upper)}) + 1;
@@ -868,20 +818,15 @@ struct ModuloTrace
 		return relations;
 	}
 
-	std::vector<ModuloRelation> trace_selection(Cell *driver, int width, int branch_width, int depth)
+	std::vector<ModuloRelation> trace_selection(Cell *driver, int width, int depth)
 	{
-		SigSpec select = index.port(driver, ID::S);
-		SigSpec fallback = index.port(driver, ID::A);
-		SigSpec data = index.port(driver, ID::B);
-		int count = GetSize(select);
-		if (count == 0 || count > 64 || GetSize(fallback) != branch_width ||
-				GetSize(data) / count != branch_width || GetSize(data) % count != 0)
+		int count = GetSize(driver->getPort(ID::S));
+		if (count == 0 || count > pmux_max_rows)
 			return {};
 
 		std::vector<ModuloRelation> relations;
 		bool first = true;
-		for (int i = -1; i < count; i++) {
-			SigSpec branch = i == -1 ? fallback.extract(0, width) : data.extract(i * branch_width, width);
+		for (const auto &branch : arithmetic_arms(index, driver, width, count)) {
 			if (branch.is_fully_const() && branch.as_const().is_fully_undef_x_only())
 				continue;
 			auto alternatives = trace(branch, depth + 1);
@@ -914,7 +859,7 @@ struct ModuloTrace
 
 bool rewrite_modulo(PmuxCoarseIndex &index, Cell *root)
 {
-	if (!index.editable(root) || (root->getParam(ID::A_SIGNED).as_bool() && root->getParam(ID::B_SIGNED).as_bool()))
+	if (!index.editable(root) || (pmux_is_signed_port(root, ID::A) && pmux_is_signed_port(root, ID::B)))
 		return false;
 	SigSpec modulus = index.port(root, ID::B);
 	if (modulus.empty() || GetSize(modulus) > 4096 || !modulus.is_fully_def() || modulus.is_fully_zero())
@@ -924,24 +869,24 @@ bool rewrite_modulo(PmuxCoarseIndex &index, Cell *root)
 	auto relations = tracer.trace(original);
 	if (tracer.remaining < 0)
 		return false;
-	// 追踪先记录当前信号，再记录更深的基底。
-	for (auto it = relations.rbegin(); it != relations.rend(); ++it) {
-		auto &relation = *it;
+	// Prefer deeper bases to the original signal.
+	for (auto &relation : relations | std::views::reverse) {
 		if (!relation.selection || !relation.residue.is_fully_zero() || relation.base == original)
 			continue;
 		relation.region.insert(root);
-		PmuxRewrite candidate(index.module, index, "arith-modulo-congruence");
+		PmuxRewrite candidate(index.module, index, "arith_modulo_congruence");
 		SigSpec result(candidate.staging.addWire(NEW_ID, GetSize(root->getPort(ID::Y))));
-		Cell *replacement = candidate.staging.addCell(NEW_ID, root);
+		Cell *replacement = candidate.staging.addCell(NEW_ID, root->type);
+		replacement->attributes = root->attributes;
+		replacement->parameters = root->parameters;
 		replacement->setPort(ID::A, relation.base);
 		replacement->setPort(ID::B, modulus);
 		replacement->setPort(ID::Y, result);
 		replacement->setParam(ID::A_WIDTH, GetSize(relation.base));
-		if (!prepare_arithmetic_rewrite(candidate, index, root, relation.region, result))
-			continue;
-		if (GetSize(relation.base) >= GetSize(original) && candidate.removed.size() == 1)
-			continue;
-		if (!candidate.validate())
+		candidate.connect(root->getPort(ID::Y), result);
+		candidate.find_removable(relation.region);
+		if (!candidate.removed.count(root) || (GetSize(relation.base) >= GetSize(original) && candidate.removed.size() == 1) ||
+				!candidate.validate())
 			continue;
 		log("  Reducing constant modulo at %s.%s (%d cells removed, %d added).\n",
 			log_id(index.module), log_id(root), GetSize(candidate.removed), candidate.added_count());
@@ -949,65 +894,6 @@ bool rewrite_modulo(PmuxCoarseIndex &index, Cell *root)
 		return true;
 	}
 	return false;
-}
-
-template<typename Match>
-std::vector<IdString> selected_roots(Module *module, Match match)
-{
-	std::vector<IdString> names;
-	for (Cell *cell : module->selected_cells())
-		if (match(cell))
-			names.push_back(cell->name);
-	std::sort(names.begin(), names.end());
-	return names;
-}
-
-template<typename Rewrite>
-int rewrite_roots(PmuxCoarseIndex &index, const std::vector<IdString> &names, Rewrite rewrite)
-{
-	int changes = 0;
-	for (IdString name : names)
-		if (Cell *cell = index.module->cell(name))
-			changes += rewrite(index, cell);
-	return changes;
-}
-
-int rewrite_modulos(PmuxCoarseIndex &index)
-{
-	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type.in(ID($mod), ID($modfloor)); });
-	return rewrite_roots(index, names, rewrite_modulo);
-}
-
-int rewrite_extrema(PmuxCoarseIndex &index)
-{
-	auto names = selected_roots(index.module, [](Cell *cell) { return cell->type == ID($pmux); });
-	return rewrite_roots(index, names, rewrite_extremum);
-}
-
-int rewrite_excluded_terms(PmuxCoarseIndex &index, bool external_inputs)
-{
-	auto names = selected_roots(index.module, [](Cell *cell) {
-		return cell->type.in(ID($mux), ID($pmux)) && GetSize(cell->getPort(ID::S)) >= 2;
-	});
-	return rewrite_roots(index, names, [external_inputs](PmuxCoarseIndex &index, Cell *cell) {
-		return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::ExcludedTerm);
-	});
-}
-
-int rewrite_common_columns(PmuxCoarseIndex &index, bool external_inputs)
-{
-	std::vector<IdString> names, operators;
-	for (Cell *cell : index.module->cells()) {
-		bool selection = cell->type.in(ID($mux), ID($pmux));
-		if ((selection || arithmetic_type(cell->type)) && index.module->selected(cell))
-			(selection ? names : operators).push_back(cell->name);
-	}
-	std::sort(names.begin(), names.end());
-	std::sort(operators.begin(), operators.end());
-	names.insert(names.end(), operators.begin(), operators.end());
-	return rewrite_roots(index, names, [external_inputs](PmuxCoarseIndex &index, Cell *cell) {
-		return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::CommonColumns);
-	});
 }
 
 struct OptPmuxArithPass : public Pass
@@ -1028,27 +914,40 @@ struct OptPmuxArithPass : public Pass
 
 	void execute(std::vector<std::string> args, Design *design) override
 	{
-		log_header(design, "Executing OPT_PMUX_ARITH pass.\n");
 		extra_args(args, 1, design);
-		if (pmux_coarse_observes_undef(design))
-			return;
 		pool<IdString> instantiated;
 		for (Module *module : design->modules())
 			for (Cell *cell : module->cells())
 				if (design->module(cell->type))
 					instantiated.insert(cell->type);
-		for (Module *module : design->selected_modules()) {
-			if (module->has_processes_warn())
-				continue;
+		pmux_run_pass(design, "opt_pmux_arith", "Executing OPT_PMUX_ARITH pass.\n", [&](Module *module) {
 			PmuxCoarseIndex index(module);
 			bool external_inputs = !instantiated.count(module->name);
-			int changes = rewrite_modulos(index);
-			changes += rewrite_extrema(index);
-			changes += rewrite_excluded_terms(index, external_inputs);
-			changes += rewrite_common_columns(index, external_inputs);
-			if (changes)
-				design->scratchpad_set_bool("opt.did_something", true);
-		}
+			int changes = 0;
+			auto run = [&](auto match, auto rewrite, bool selections_first = false) {
+				std::vector<std::pair<bool, IdString>> names;
+				for (auto cell : module->selected_cells())
+					if (match(cell))
+						names.emplace_back(selections_first && arithmetic_type(cell->type), cell->name);
+				std::ranges::sort(names, [](const auto &a, const auto &b) {
+					return a.first != b.first ? a.first < b.first : a.second.lt_by_name(b.second);
+				});
+				for (const auto &root : names)
+					if (auto cell = module->cell(root.second))
+						changes += rewrite(index, cell);
+			};
+			run([](Cell *cell) { return cell->type.in(ID($mod), ID($modfloor)); }, rewrite_modulo);
+			run([](Cell *cell) { return cell->type == ID($pmux); }, rewrite_extremum);
+			run([](Cell *cell) { return cell->type == ID($pmux) && GetSize(cell->getPort(ID::S)) >= 2; },
+					[=](PmuxCoarseIndex &index, Cell *cell) {
+						return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::ExcludedTerm);
+					});
+			run([](Cell *cell) { return cell->type.in(ID($mux), ID($pmux)) || arithmetic_type(cell->type); },
+					[=](PmuxCoarseIndex &index, Cell *cell) {
+						return rewrite_arithmetic(index, cell, external_inputs, ArithmeticTransform::CommonColumns);
+					}, true);
+			return changes;
+		});
 	}
 } OptPmuxArithPass;
 

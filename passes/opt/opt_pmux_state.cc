@@ -1,66 +1,53 @@
 #include "kernel/ff.h"
-#include "kernel/yosys.h"
-#include "passes/opt/pmux_encoding.h"
 #include "passes/opt/pmux_rewrite.h"
+#include "passes/opt/pmux_select_tree.h"
+
+#include <bit>
+#include <numeric>
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
-using StateCode = dict<SigBit, bool>;
+struct StateCode {
+	pool<SigBit> zeros, ones;
+	bool inverted = false;
 
-bool clocked_ff(Cell *cell)
-{
-	return cell && cell->type.in(ID($dff), ID($dffe), ID($adff), ID($adffe), ID($sdff), ID($sdffe), ID($sdffce));
-}
+	bool matches(SigBit high) const
+	{
+		bool equal = ones.empty() ? !zeros.count(high) : GetSize(ones) == 1 && ones.count(high);
+		return equal != inverted;
+	}
 
-bool onehot(const Const &value)
-{
-	return value.is_fully_def() && std::count(value.begin(), value.end(), State::S1) == 1;
-}
+	bool uses_only(const pool<SigBit> &state) const
+	{
+		auto contains = [&](SigBit bit) { return state.count(bit); };
+		return std::all_of(zeros.begin(), zeros.end(), contains) && std::all_of(ones.begin(), ones.end(), contains);
+	}
+};
 
-std::optional<StateCode> comparison(PmuxCoarseIndex &index, Cell *cell, pool<SigBit> *dependencies = nullptr)
+std::optional<StateCode> comparison_literals(const SigMap &sigmap, Cell *cell)
 {
 	if (!cell || !cell->type.in(ID($eq), ID($ne), ID($logic_not)) || GetSize(cell->getPort(ID::Y)) != 1)
 		return std::nullopt;
-	auto operands = index.comparison_operands(cell, 128);
+	auto operands = pmux_comparison_operands(cell, 128, sigmap);
 	if (!operands)
 		return std::nullopt;
 	const auto &[a, b] = *operands;
-	StateCode result;
+	StateCode result{{}, {}, cell->type == ID($ne)};
 	for (int offset = 0; offset < GetSize(a); ++offset) {
 		SigBit bit = a[offset], value = b[offset];
-		if (dependencies) {
-			if (bit.wire)
-				dependencies->insert(bit);
-			if (value.wire)
-				dependencies->insert(value);
-		}
 		if (!bit.wire)
 			std::swap(bit, value);
-		if (value.wire || (value != State::S0 && value != State::S1))
+		if (value != State::S0 && value != State::S1)
 			return std::nullopt;
-		if (!bit.wire) {
-			if (bit != value)
-				return std::nullopt;
+		if (bit == value)
 			continue;
-		}
 		bool high = value == State::S1;
-		auto inserted = result.emplace(bit, high);
-		if (!inserted.second && inserted.first->second != high)
+		if (!bit.wire || (high ? result.zeros : result.ones).count(bit))
 			return std::nullopt;
+		(high ? result.ones : result.zeros).insert(bit);
 	}
 	return result;
-}
-
-int high_literals(const StateCode &code)
-{
-	return std::count_if(code.begin(), code.end(), [](const auto &literal) { return literal.second; });
-}
-
-bool matches_onehot(const StateCode &code, int ones, SigBit high)
-{
-	auto literal = code.find(high);
-	return literal == code.end() ? ones == 0 : literal->second && ones == 1;
 }
 
 class StateWorker
@@ -69,196 +56,145 @@ class StateWorker
 	PmuxCoarseIndex index;
 	FfInitVals initvals;
 
-	struct OnehotProof {
-		bool proven = false;
-		pool<SigBit> dependencies;
-	};
-	using OnehotProofs = dict<Cell *, OnehotProof>;
-
-	std::optional<std::vector<bool>> state_only_branches(const SigSpec &select, const pool<SigBit> &state,
-			pool<SigBit> &dependencies)
+	std::optional<std::vector<bool>> reachable_branches(const SigSpec &select, const pool<SigBit> &state)
 	{
-		std::vector<bool> reachable(GetSize(select) + 1);
-		pool<SigBit> matched;
-		for (int i = 0; i < GetSize(select); ++i) {
-			SigBit bit = select[i];
-			if (bit.wire)
-				dependencies.insert(bit);
-			if (bit == State::S0)
-				continue;
-			StateCode condition;
-			bool inverted = false;
-			if (state.count(bit)) {
-				condition.emplace(bit, true);
-			} else if (bit != State::S1) {
-				auto cell = index.driver(bit);
-				auto code = comparison(index, cell, &dependencies);
-				if (!code || std::any_of(code->begin(), code->end(), [&](const auto &literal) { return !state.count(literal.first); }))
-					return std::nullopt;
-				condition = std::move(*code);
-				inverted = cell->type == ID($ne);
-			}
-			int ones = high_literals(condition);
-			for (auto high : state)
-				if (matches_onehot(condition, ones, high) != inverted) {
-					if (!matched.insert(high).second)
-						return std::nullopt;
-					reachable[i + 1] = true;
-				}
-		}
-		reachable[0] = GetSize(matched) < GetSize(state);
-		return reachable;
-	}
-
-	std::optional<std::vector<bool>> reachable_branches(const SigSpec &select, const pool<SigBit> &state,
-			pool<SigBit> &dependencies)
-	{
-		PmuxEncoding encoding(index, &dependencies);
+		PmuxEncoding encoding(index);
 		std::vector<uint64_t> conditions;
 		for (auto bit : select) {
 			auto truth = encoding.decode(bit);
 			if (!truth)
-				return state_only_branches(select, state, dependencies);
+				break;
 			conditions.push_back(*truth);
 		}
-		unsigned state_mask = 0;
-		int state_controls = 0;
-		for (int offset = 0; offset < GetSize(encoding.controls); ++offset)
-			if (state.count(encoding.controls[offset])) {
-				state_mask |= 1u << offset;
-				++state_controls;
-			}
 		std::vector<bool> reachable(GetSize(select) + 1);
-		for (unsigned row = 0; row < (1u << GetSize(encoding.controls)); ++row) {
-			unsigned state_code = row & state_mask;
-			if ((state_code & (state_code - 1)) || (!state_code && state_controls == GetSize(state)))
-				continue;
-			int branch = 0;
-			for (int i = 0; i < GetSize(conditions); ++i)
-				if ((conditions[i] >> row) & 1) {
-					if (branch)
-						return std::nullopt;
-					branch = i + 1;
-				}
-			reachable[branch] = true;
+		if (GetSize(conditions) != GetSize(select)) {
+			// Wide state vectors can still be proved with state-only comparisons.
+			std::vector<StateCode> codes;
+			for (auto bit : select) {
+				auto code = state.count(bit) ? StateCode{{}, {bit}} : bit == State::S0 ? StateCode{{}, {}, true} :
+						bit == State::S1 ? std::optional<StateCode>(StateCode{}) : comparison_literals(index.sigmap, index.driver(bit));
+				if (!code || !code->uses_only(state))
+					return std::nullopt;
+				codes.push_back(std::move(*code));
+			}
+			for (auto high : state) {
+				int arm = 0;
+				for (int i = 0; i < GetSize(codes); ++i)
+					if (codes[i].matches(high)) {
+						if (arm)
+							return std::nullopt;
+						arm = i + 1;
+					}
+				reachable[arm] = true;
+			}
+			return reachable;
 		}
+		unsigned state_mask = 0;
+		for (int offset = 0; offset < GetSize(encoding.controls()); ++offset)
+			if (state.count(encoding.controls()[offset]))
+				state_mask |= 1u << offset;
+		bool full_state = std::popcount(state_mask) == GetSize(state);
+		int controls = GetSize(encoding.controls());
+		uint64_t valid = 0;
+		for (int row = 0; row < pmux_encoding_limit(controls); ++row) {
+			int ones = std::popcount(unsigned(row) & state_mask);
+			if (ones == 1 || (ones == 0 && !full_state))
+				valid |= uint64_t(1) << row;
+		}
+		auto table = pmux_branch_table(conditions, controls, valid);
+		if (!table)
+			return std::nullopt;
+		for (; valid; valid &= valid - 1)
+			reachable[(*table)[std::countr_zero(valid)]] = true;
 		return reachable;
 	}
 
-	bool onehot_next(const SigSpec &value, const pool<SigBit> &bits, pool<Cell *> &active,
-			pool<SigSpec> &proven, pool<SigBit> &dependencies, int &budget, int depth)
+	static bool onehot(const Const &value)
 	{
-		if (--budget < 0 || depth > 16 || GetSize(value) != GetSize(bits))
+		return value.is_fully_def() && std::count(value.begin(), value.end(), State::S1) == 1;
+	}
+
+	bool onehot_next(const SigSpec &value, const pool<SigBit> &bits, dict<SigSpec, bool> &proven, int &budget, int depth)
+	{
+		if (budget == 0 || depth > 16 || GetSize(value) != GetSize(bits))
 			return false;
-		if (proven.count(value))
-			return true;
-		for (auto bit : value)
-			if (bit.wire)
-				dependencies.insert(bit);
+		--budget;
 		if (value.is_fully_const())
 			return onehot(value.as_const());
-		if (pool<SigBit>(value.begin(), value.end()) == bits)
+		if (value.to_sigbit_pool() == bits)
 			return true;
+		if (auto [proof, inserted] = proven.emplace(value, false); !inserted)
+			return proof->second;
 		auto mux = index.driver(value[0]);
-		if (!mux || !mux->type.in(ID($mux), ID($pmux)) || index.port(mux, ID::Y) != value || !active.insert(mux).second)
+		if (!mux || !mux->type.in(ID($mux), ID($pmux)) || index.port(mux, ID::Y) != value)
 			return false;
 		for (auto bit : value)
 			if (index.driver(bit) != mux)
 				return false;
-		SigSpec a = index.port(mux, ID::A), b = index.port(mux, ID::B), select = index.port(mux, ID::S);
-		int width = GetSize(value);
-		if (GetSize(a) != width || select.empty() || GetSize(select) > 128 || GetSize(b) != width * GetSize(select))
+		auto a = index.port(mux, ID::A), b = index.port(mux, ID::B), select = index.port(mux, ID::S);
+		int width = GetSize(value), branches = GetSize(select);
+		log_assert(GetSize(a) == width && branches > 0 && GetSize(b) == width * branches);
+		if (branches > 128)
 			return false;
-		if (mux->type == ID($mux)) {
-			if (GetSize(select) != 1 || !onehot_next(a, bits, active, proven, dependencies, budget, depth + 1) ||
-					!onehot_next(b, bits, active, proven, dependencies, budget, depth + 1))
+		const auto reachable = mux->type == ID($pmux) ? reachable_branches(select, bits) : std::vector<bool>{true, true};
+		if (!reachable)
+			return false;
+		log_assert(GetSize(*reachable) == GetSize(select) + 1);
+		a.append(b);
+		for (int branch = 0; branch <= branches; ++branch)
+			if ((*reachable)[branch] && !onehot_next(a.extract(branch * width, width), bits, proven, budget, depth + 1))
 				return false;
-		} else {
-			auto reachable = reachable_branches(select, bits, dependencies);
-			if (!reachable || ((*reachable)[0] && !onehot_next(a, bits, active, proven, dependencies, budget, depth + 1)))
-				return false;
-			for (int branch = 0; branch < GetSize(select); ++branch)
-				if ((*reachable)[branch + 1] && !onehot_next(b.extract(branch * width, width), bits, active, proven, dependencies, budget, depth + 1))
-					return false;
-		}
-		active.erase(mux);
-		proven.insert(value);
-		return true;
+		return proven.at(value) = true;
 	}
 
-	bool onehot_register(Cell *state, pool<SigBit> &dependencies)
+	bool onehot_register(Cell *state, const pool<SigBit> &bits)
 	{
 		FfData ff(&initvals, state);
-		SigSpec q = index.sigmap(ff.sig_q);
-		for (auto bit : q)
-			if (bit.wire)
-				dependencies.insert(bit);
-		if (!ff.has_clk || ff.has_aload || ff.has_sr || GetSize(q) < 2 || GetSize(q) > 128 || !onehot(ff.val_init) ||
+		if (ff.has_aload || ff.has_sr || GetSize(bits) != ff.width || ff.width < 2 || ff.width > 128 || !onehot(ff.val_init) ||
 				(ff.has_arst && !onehot(ff.val_arst)) || (ff.has_srst && !onehot(ff.val_srst)))
 			return false;
-		pool<SigBit> bits(q.begin(), q.end());
-		if (GetSize(bits) != GetSize(q))
+		if (std::any_of(bits.begin(), bits.end(), [&](SigBit bit) { return index.driver(bit) != state; }))
 			return false;
-		for (auto bit : bits)
-			if (index.driver(bit) != state)
-				return false;
-		pool<Cell *> active;
-		pool<SigSpec> proven;
+		dict<SigSpec, bool> proven;
 		int budget = 128;
-		return onehot_next(index.sigmap(ff.sig_d), bits, active, proven, dependencies, budget, 0);
+		return onehot_next(index.sigmap(ff.sig_d), bits, proven, budget, 0);
 	}
 
-	bool replace_decode(Cell *cell, OnehotProofs &onehot_states)
+	bool replace_decode(Cell *cell, dict<Cell *, bool> &onehot_states)
 	{
 		if (!index.editable(cell) || !initvals(cell->getPort(ID::Y)).is_fully_undef())
 			return false;
-		auto compare = comparison(index, cell);
-		if (!compare || compare->empty())
+		auto compare = comparison_literals(index.sigmap, cell);
+		if (!compare || (compare->zeros.empty() && compare->ones.empty()))
 			return false;
-		auto state = index.driver(compare->begin()->first);
-		if (!clocked_ff(state) || std::any_of(compare->begin(), compare->end(), [&](const auto &literal) {
-				return index.driver(literal.first) != state;
-			}))
+		const auto &literals = compare->ones.empty() ? compare->zeros : compare->ones;
+		auto state = index.driver(*literals.begin());
+		if (!state || !pmux_is_clocked_ff(state))
 			return false;
-		auto [status, inserted] = onehot_states.emplace(state, OnehotProof{});
-		if (inserted)
-			status->second.proven = onehot_register(state, status->second.dependencies);
-		if (!status->second.proven)
-			return false;
-
 		SigSpec q = index.port(state, ID::Q);
-		int required_ones = high_literals(*compare);
+		auto state_bits = q.to_sigbit_pool();
+		if (!compare->uses_only(state_bits))
+			return false;
+		auto [proof, inserted] = onehot_states.emplace(state, false);
+		if (inserted)
+			proof->second = onehot_register(state, state_bits);
+		if (!proof->second)
+			return false;
 		SigBit replacement(State::S0);
 		int matches = 0;
-		for (auto bit : q) {
-			bool equal = matches_onehot(*compare, required_ones, bit);
-			if (equal != (cell->type == ID($ne))) {
+		for (auto bit : q)
+			if (compare->matches(bit)) {
 				matches++;
 				replacement = bit;
 			}
-		}
-		if (matches == GetSize(q))
-			replacement = State::S1;
-		else if (matches > 1)
+		if (matches > 1 && matches != GetSize(q))
 			return false;
-
-		auto y = index.port(cell, ID::Y);
-		auto input = index.sigmap(replacement);
-		PmuxRewrite rewrite(module, index, "one-hot state decode");
-		rewrite.find_removable({cell}, {}, pool<SigBit>(y.begin(), y.end()), {input});
-		rewrite.connect(cell->getPort(ID::Y), input);
+		PmuxRewrite rewrite(module, index, "onehot_state_decode");
+		rewrite.connect(cell->getPort(ID::Y), matches == GetSize(q) ? SigBit(State::S1) : replacement);
+		rewrite.find_removable({cell});
 		if (!rewrite.validate())
 			return false;
 		rewrite.commit();
-		// 旧输出的驱动已经改变。替代信号保留驱动，只有代表位变化才会影响证明。
-		bool input_changed = input.wire && index.sigmap(input) != input;
-		for (auto it = onehot_states.begin(); it != onehot_states.end(); ) {
-			const auto &dependencies = it->second.dependencies;
-			if (dependencies.count(y.as_bit()) || (input_changed && dependencies.count(input)))
-				it = onehot_states.erase(it);
-			else
-				++it;
-		}
 		return true;
 	}
 
@@ -267,21 +203,19 @@ class StateWorker
 		SigBit enable;
 		bool active_high;
 	};
-
-	std::pair<SigBit, bool> capture_select(const Capture &bank)
-	{
-		if (bank.active_high)
-			return {bank.enable, false};
-		auto driver = index.driver(bank.enable);
-		if (driver && driver->type.in(ID($not), ID($logic_not)) && GetSize(driver->getPort(ID::A)) == 1 &&
-				GetSize(driver->getPort(ID::Y)) == 1)
-			return {index.port(driver, ID::A)[0], false};
-		return {bank.enable, true};
-	}
+	struct CaptureGroup {
+		std::vector<Capture> banks;
+		const PmuxEncoding &encoding;
+		std::vector<int> arms;
+		pool<Cell *> candidates;
+		SigSpec clock;
+		Const initial;
+		bool polarity;
+	};
 
 	std::optional<Capture> capture(Cell *bank, const SigSpec &clock, bool polarity, const SigSpec &q, pool<Cell *> &candidates)
 	{
-		if (!clocked_ff(bank) || index.port(bank, ID::Q) != q)
+		if (!bank || !pmux_is_clocked_ff(bank) || index.port(bank, ID::Q) != q)
 			return std::nullopt;
 		for (auto bit : q)
 			if (index.driver(bit) != bank)
@@ -305,19 +239,20 @@ class StateWorker
 		return Capture{a == q ? b : a, index.port(feedback, ID::S)[0], a == q};
 	}
 
-	SigSpec capture_selection(Module &staging, const std::vector<Capture> &captures, const std::vector<uint64_t> &conditions,
-			const SigSpec &fallback, pool<SigBit> &inputs)
+	SigSpec decoded_input(Module &staging, const std::vector<Capture> &banks, const SigSpec &fallback)
 	{
 		SigSpec data, selects, inverted;
 		std::vector<int> invert_offsets;
-		for (int code = 0; code < GetSize(captures); ++code) {
-			if (!conditions[code])
+		for (const auto &bank : banks) {
+			if (bank.data.empty())
 				continue;
-			const auto &bank = captures[code];
 			data.append(bank.data);
-			inputs.insert(bank.data.begin(), bank.data.end());
-			auto [enable, invert] = capture_select(bank);
-			if (invert) {
+			auto enable = bank.enable;
+			auto inverter = bank.active_high ? nullptr : index.driver(enable);
+			if (inverter && inverter->type.in(ID($not), ID($logic_not)) &&
+					GetSize(inverter->getPort(ID::A)) == 1 && GetSize(inverter->getPort(ID::Y)) == 1) {
+				enable = index.port(inverter, ID::A).as_bit();
+			} else if (!bank.active_high) {
 				invert_offsets.push_back(GetSize(selects));
 				inverted.append(enable);
 			}
@@ -325,197 +260,158 @@ class StateWorker
 		}
 		if (GetSize(selects) == 1)
 			return data;
-		inputs.insert(fallback.begin(), fallback.end());
-		inputs.insert(selects.begin(), selects.end());
 		if (!inverted.empty()) {
-			auto normalized = staging.addWire(NEW_ID, GetSize(inverted));
-			staging.addNot(NEW_ID, inverted, normalized);
+			auto normalized = staging.Not(NEW_ID, inverted);
 			for (int i = 0; i < GetSize(invert_offsets); ++i)
-				selects[invert_offsets[i]] = SigBit(normalized, i);
+				selects[invert_offsets[i]] = normalized[i];
 		}
-		auto output = staging.addWire(NEW_ID, GetSize(fallback));
-		staging.addPmux(NEW_ID, fallback, data, selects, output);
-		return output;
+		return staging.Pmux(NEW_ID, fallback, data, selects);
 	}
 
-	SigSpec encoded_selection(Module &staging, const std::vector<Capture> &captures, const std::vector<uint64_t> &conditions,
-			const std::vector<SigBit> &controls, int width, pool<SigBit> &inputs)
+	SigSpec encoded_input(Module &staging, const CaptureGroup &group, int width)
 	{
-		std::vector<SigSpec> rows(1 << GetSize(controls));
-		for (int code = 0; code < GetSize(captures); ++code)
+		PmuxSelectTree tree(index, group.encoding);
+		std::vector<int> controls(GetSize(group.encoding.controls())), roots, rows(group.arms.size());
+		std::iota(controls.begin(), controls.end(), 0);
+		for (int bit = 0; bit < width; ++bit) {
 			for (int row = 0; row < GetSize(rows); ++row)
-				if ((conditions[code] >> row) & 1) {
-					rows[row] = captures[code].data;
-					inputs.insert(rows[row].begin(), rows[row].end());
-				}
-		for (auto control : controls) {
-			SigSpec low, high;
-			std::vector<int> offsets;
-			for (int row = 0; row < GetSize(rows) / 2; ++row) {
-				if (rows[2 * row] == rows[2 * row + 1]) {
-					rows[row] = rows[2 * row];
-					continue;
-				}
-				low.append(rows[2 * row]);
-				high.append(rows[2 * row + 1]);
-				offsets.push_back(row);
-			}
-			rows.resize(GetSize(rows) / 2);
-			if (!offsets.empty()) {
-				inputs.insert(control);
-				SigSpec stage = staging.addWire(NEW_ID, GetSize(low));
-				staging.addMux(NEW_ID, low, high, control, stage);
-				for (int i = 0; i < GetSize(offsets); ++i)
-					rows[offsets[i]] = stage.extract(i * width, width);
-			}
+				rows[row] = tree.literal(group.banks[group.arms[row] - 1].data[bit]);
+			roots.push_back(tree.column(rows, controls));
 		}
-		return rows.front();
+		return tree.emit(&staging, roots, {}, tree.analyze(roots));
+	}
+
+	std::optional<CaptureGroup> analyze_banks(Cell *mux, PmuxEncoding &capture_encoding)
+	{
+		SigSpec y = index.port(mux, ID::Y), select = index.port(mux, ID::S), banks = index.port(mux, ID::B);
+		int width = GetSize(y), branches = GetSize(select);
+		if (branches < 2 || branches > 16 || !initvals(y).is_fully_undef())
+			return std::nullopt;
+		PmuxEncoding output_encoding(index);
+		std::vector<int> selected_banks;
+		if (!output_encoding.branch_table(select, selected_banks) || GetSize(selected_banks) != branches ||
+				output_encoding.controls().empty())
+			return std::nullopt;
+		auto state = index.driver(output_encoding.controls().front());
+		if (!state || state->type != ID($dff))
+			return std::nullopt;
+		FfData state_ff(&initvals, state);
+		SigSpec q = index.sigmap(state_ff.sig_q);
+		if (GetSize(q) != GetSize(output_encoding.controls()) || !state_ff.val_init.is_fully_def())
+			return std::nullopt;
+		CaptureGroup group{std::vector<Capture>(branches), capture_encoding, {}, output_encoding.cells(),
+				index.sigmap(state_ff.sig_clk), {}, state_ff.pol_clk};
+		group.candidates.insert(mux);
+		group.candidates.insert(state);
+		std::vector<uint64_t> next_bits;
+		for (auto bit : q)
+			if (index.driver(bit) != state || !output_encoding.slots().count(bit))
+				return std::nullopt;
+		for (auto bit : index.sigmap(state_ff.sig_d)) {
+			auto truth = capture_encoding.pin(bit);
+			if (!truth)
+				return std::nullopt;
+			next_bits.push_back(*truth);
+		}
+		const int control_count = GetSize(capture_encoding.controls());
+		pool<int> seen_banks;
+		pool<Cell *> seen_cells{state};
+		std::vector<uint64_t> conditions(branches);
+		const unsigned initial_code = state_ff.val_init.as_int();
+		for (unsigned row = 0; row < unsigned(branches); ++row) {
+			const int arm = selected_banks[row];
+			if (arm == 0 || !seen_banks.insert(arm).second)
+				return std::nullopt;
+			unsigned code = 0;
+			uint64_t condition = ~uint64_t(0);
+			for (int offset = 0; offset < GetSize(q); ++offset) {
+				bool high = (row >> output_encoding.slots().at(q[offset])) & 1;
+				code |= unsigned(high) << offset;
+				condition &= high ? next_bits[offset] : ~next_bits[offset];
+			}
+			SigSpec bank_q = banks.extract((arm - 1) * width, width);
+			auto bank = index.driver(bank_q[0]);
+			auto next = capture(bank, group.clock, group.polarity, bank_q, group.candidates);
+			if (!next || !seen_cells.insert(bank).second)
+				return std::nullopt;
+			auto truth = capture_encoding.decode(next->enable);
+			if (!truth || GetSize(capture_encoding.controls()) != control_count || (next->active_high ? *truth : ~*truth) != condition)
+				return std::nullopt;
+			group.candidates.insert(bank);
+			conditions[code] = condition;
+			if (condition)
+				group.banks[code] = std::move(*next);
+			if (code == initial_code)
+				group.initial = initvals(bank_q);
+		}
+		if (GetSize(group.initial) != width || !group.initial.is_fully_def())
+			return std::nullopt;
+		auto table = pmux_branch_table(conditions, control_count);
+		log_assert(table && std::none_of(table->begin(), table->end(), [](int arm) { return arm == 0; }));
+		group.arms = std::move(*table);
+		group.candidates.insert(capture_encoding.cells().begin(), capture_encoding.cells().end());
+		return group;
 	}
 
 	bool compress_bank_group(Cell *mux)
 	{
 		if (!pmux_select_shape(mux) || !index.editable(mux))
 			return false;
-		SigSpec y = index.port(mux, ID::Y), select = index.port(mux, ID::S), banks = index.port(mux, ID::B);
-		int width = GetSize(y), branches = GetSize(select);
-		if (branches < 2 || branches > 16 || !initvals(y).is_fully_undef())
+		PmuxEncoding encoding(index);
+		auto group = analyze_banks(mux, encoding);
+		if (!group)
 			return false;
-		PmuxEncoding output_encoding(index);
-		std::vector<int> selected_banks;
-		if (!output_encoding.branch_table(select, selected_banks) || GetSize(selected_banks) != branches ||
-				output_encoding.controls.empty())
-			return false;
-		auto state = index.driver(output_encoding.controls.front());
-		if (!state || state->type != ID($dff))
-			return false;
-		FfData state_ff(&initvals, state);
-		SigSpec q = index.sigmap(state_ff.sig_q), d = index.sigmap(state_ff.sig_d), clock = index.sigmap(state_ff.sig_clk);
-		if (GetSize(q) != GetSize(output_encoding.controls) || !state_ff.val_init.is_fully_def())
-			return false;
-		PmuxEncoding capture_encoding(index);
-		std::vector<uint64_t> next_bits;
-		for (auto bit : q)
-			if (index.driver(bit) != state || !output_encoding.slots.count(bit))
-				return false;
-		for (auto bit : d) {
-			auto truth = capture_encoding.pin(bit);
-			if (!truth)
-				return false;
-			next_bits.push_back(*truth);
-		}
-		int capture_controls = GetSize(capture_encoding.controls);
-		pool<int> seen_banks;
-		pool<Cell *> candidates = output_encoding.cells, bank_cells;
-		candidates.insert(mux);
-		candidates.insert(state);
-		std::vector<Capture> captures(branches);
-		std::vector<uint64_t> conditions(branches);
-		Const initial;
-		for (int row = 0; row < branches; ++row) {
-			int branch = selected_banks[row];
-			if (branch < 0 || !seen_banks.insert(branch).second)
-				return false;
-			unsigned code = 0;
-			uint64_t condition = ~uint64_t(0);
-			bool initial_bank = true;
-			for (int offset = 0; offset < GetSize(q); ++offset) {
-				bool high = (row >> output_encoding.slots.at(q[offset])) & 1;
-				code |= unsigned(high) << offset;
-				initial_bank &= (state_ff.val_init[offset] == State::S1) == high;
-				condition &= high ? next_bits[offset] : ~next_bits[offset];
-			}
-			SigSpec bank_q = banks.extract(branch * width, width);
-			auto bank = index.driver(bank_q[0]);
-			auto bank_capture = capture(bank, clock, state_ff.pol_clk, bank_q, candidates);
-			if (bank == state || !bank_capture || !bank_cells.insert(bank).second)
-				return false;
-			auto truth = capture_encoding.decode(bank_capture->enable);
-			if (!truth || GetSize(capture_encoding.controls) != capture_controls || (bank_capture->active_high ? *truth : ~*truth) != condition)
-				return false;
-			candidates.insert(bank);
-			captures[code] = std::move(*bank_capture);
-			conditions[code] = condition;
-			if (initial_bank)
-				initial = initvals(bank_q);
-		}
-		if (GetSize(initial) != width || !initial.is_fully_def())
-			return false;
-		candidates.insert(capture_encoding.cells.begin(), capture_encoding.cells.end());
-		SigSpec output = mux->getPort(ID::Y);
-		pool<SigBit> targets(y.begin(), y.end());
-		pool<SigBit> encoded_inputs(clock.begin(), clock.end());
-		encoded_inputs.insert(capture_encoding.controls.begin(), capture_encoding.controls.end());
-		for (int code = 0; code < GetSize(captures); ++code)
-			if (conditions[code])
-				encoded_inputs.insert(captures[code].data.begin(), captures[code].data.end());
-		auto private_cells = index.removable(candidates, {}, targets, encoded_inputs);
-		bool reuse_decode = false;
-		for (int code = 0; code < GetSize(captures); ++code) {
-			if (!conditions[code])
-				continue;
-			auto [enable, invert] = capture_select(captures[code]);
-			auto driver = index.driver(enable);
-			if (!invert && driver && capture_encoding.cells.count(driver) && !private_cells.count(driver)) {
-				reuse_decode = true;
-				break;
+		const SigSpec output = mux->getPort(ID::Y);
+		std::unique_ptr<PmuxRewrite> best;
+		std::pair<int, int> best_gain{};
+		for (bool reuse_decode : {false, true}) {
+			auto candidate = std::make_unique<PmuxRewrite>(module, index,
+					reuse_decode ? "decoded_sync_capture" : "encoded_sync_capture");
+			auto &staging = candidate->staging;
+			const auto data = reuse_decode ? decoded_input(staging, group->banks, index.port(mux, ID::A)) :
+					encoded_input(staging, *group, GetSize(output));
+			staging.addDff(NEW_ID, group->clock, data, output, group->polarity, mux->get_src_attribute());
+			candidate->find_removable(group->candidates);
+			int saved_bits = -GetSize(output);
+			for (auto cell : candidate->removed)
+				if (pmux_is_clocked_ff(cell))
+					saved_bits += GetSize(cell->getPort(ID::Q));
+			const std::pair gain{saved_bits, GetSize(candidate->removed) - candidate->added_count()};
+			if (saved_bits > 0 && gain > best_gain && candidate->removed.count(mux) && candidate->validate()) {
+				best_gain = gain;
+				best = std::move(candidate);
 			}
 		}
-		for (bool encoded : {!reuse_decode, reuse_decode}) {
-			PmuxRewrite rewrite(module, index, encoded ? "encoded synchronous capture" : "decoded synchronous capture");
-			pool<SigBit> inputs(clock.begin(), clock.end());
-			SigSpec input = encoded ? encoded_selection(rewrite.staging, captures, conditions, capture_encoding.controls, width, inputs) :
-				capture_selection(rewrite.staging, captures, conditions, index.port(mux, ID::A), inputs);
-			if (!index.independent(inputs, targets))
-				continue;
-			rewrite.staging.addDff(NEW_ID, clock, input, output, state_ff.pol_clk, mux->get_src_attribute());
-			rewrite.find_removable(candidates, {}, targets, inputs);
-			int removed_bits = 0;
-			for (auto cell : rewrite.removed)
-				if (clocked_ff(cell))
-					removed_bits += GetSize(cell->getPort(ID::Q));
-			if (!rewrite.removed.count(mux) || removed_bits <= width || !rewrite.validate())
-				continue;
-			for (auto cell : rewrite.removed)
-				if (clocked_ff(cell))
-					initvals.remove_init(cell->getPort(ID::Q));
-			rewrite.commit();
-			initvals.set_init(output, initial);
-			return true;
-		}
-		return false;
+		if (!best)
+			return false;
+		for (auto cell : best->removed)
+			if (pmux_is_clocked_ff(cell))
+				initvals.remove_init(cell->getPort(ID::Q));
+		best->commit();
+		initvals.set_init(output, group->initial);
+		return true;
 	}
 
 public:
 	explicit StateWorker(Module *module) : module(module), index(module), initvals(&index.sigmap, module) {}
 
-	int compress_banks()
+	int run()
 	{
-		std::vector<IdString> muxes;
+		std::vector<IdString> muxes, decodes;
 		for (auto cell : module->selected_cells())
 			if (cell->type == ID($pmux))
 				muxes.push_back(cell->name);
-		int groups = 0;
-		for (auto name : muxes)
-			if (auto mux = module->cell(name); mux && mux->type == ID($pmux))
-				groups += compress_bank_group(mux);
-		return groups;
-	}
-
-	int replace_decodes()
-	{
-		std::vector<IdString> decodes;
-		for (auto cell : module->selected_cells())
-			if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
+			else if (cell->type.in(ID($eq), ID($ne), ID($logic_not)))
 				decodes.push_back(cell->name);
-		OnehotProofs onehot_states;
-		int removed = 0;
-		for (auto name : decodes) {
-			auto cell = module->cell(name);
-			if (!cell || !replace_decode(cell, onehot_states))
-				continue;
-			++removed;
-		}
-		return removed;
+		int changes = 0;
+		for (auto name : muxes)
+			if (auto mux = module->cell(name))
+				changes += compress_bank_group(mux);
+		dict<Cell *, bool> onehot_states;
+		for (auto name : decodes)
+			if (auto cell = module->cell(name))
+				changes += replace_decode(cell, onehot_states);
+		return changes;
 	}
 };
 
@@ -532,21 +428,8 @@ struct OptPmuxStatePass : Pass {
 	void execute(std::vector<std::string> args, Design *design) override
 	{
 		extra_args(args, 1, design);
-		log_header(design, "Executing OPT_PMUX_STATE pass.\n");
-		if (pmux_coarse_observes_undef(design))
-			return;
-		for (auto module : design->selected_modules()) {
-			if (!module->processes.empty())
-				continue;
-			StateWorker worker(module);
-			int before = module->cells_size();
-			int groups = worker.compress_banks();
-			if (groups)
-				log("  %s: compressed %d synchronous register groups (net RTLIL cell change: %+d).\n", log_id(module), groups, module->cells_size() - before);
-			int decodes = worker.replace_decodes();
-			if (decodes)
-				log("  %s: removed %d one-hot state decoders.\n", log_id(module), decodes);
-		}
+		pmux_run_pass(design, "opt_pmux_state", "Executing OPT_PMUX_STATE pass.\n",
+				[](Module *module) { return StateWorker(module).run(); });
 	}
 } OptPmuxStatePass;
 
