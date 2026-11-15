@@ -468,7 +468,7 @@ class SelectWorker
 	int rewrite_network(std::vector<IdString> names, bool pmux_only)
 	{
 		enum class Rule { reduce, shared, specialize, rebuild_raw, dedicated };
-		const std::array rules{Rule::reduce, Rule::shared, Rule::specialize, Rule::rebuild_raw, Rule::dedicated};
+		const std::array rules{Rule::reduce, Rule::shared, Rule::dedicated, Rule::specialize, Rule::rebuild_raw};
 		int next_rule = 0;
 		int rewrites = 0;
 		while (next_rule < GetSize(rules)) {

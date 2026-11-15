@@ -193,6 +193,63 @@ struct SynthIntelPass : public ScriptPass {
 		return false;
 	}
 
+	bool has_memory() const
+	{
+		for (auto module : active_design->selected_unboxed_modules()) {
+			if (!module->memories.empty())
+				return true;
+			for (auto cell : module->cells())
+				if (cell->type.in(ID($mem), ID($mem_v2), ID($memrd), ID($memrd_v2),
+						ID($memwr), ID($memwr_v2), ID($meminit), ID($meminit_v2)))
+					return true;
+		}
+		return false;
+	}
+
+	bool has_abc9_boxes() const
+	{
+		for (auto module : active_design->modules()) {
+			if (module->get_bool_attribute(ID::abc9_box) || module->get_bool_attribute(ID::abc9_bypass))
+				return true;
+			for (auto cell : module->cells())
+				if (cell->type.in(ID($specify2), ID($specify3), ID($specrule)))
+					return true;
+		}
+		return false;
+	}
+
+	bool has_large_logic_module(int min_cells = 1024) const
+	{
+		for (auto module : active_design->selected_unboxed_modules()) {
+			int logic_cells = 0;
+			for (auto cell : module->cells())
+				if (yosys_celltypes.cell_evaluable(cell->type) && ++logic_cells >= min_cells)
+					return true;
+		}
+		return false;
+	}
+
+	bool has_large_coarse_logic() const
+	{
+		for (auto module : active_design->selected_unboxed_modules()) {
+			int logic_cells = 0;
+			int64_t logic_bits = 0;
+			for (auto cell : module->cells()) {
+				if (!yosys_celltypes.cell_evaluable(cell->type))
+					continue;
+				++logic_cells;
+				int width = 0;
+				for (auto port : {ID::A, ID::B, ID::Y})
+					if (cell->hasPort(port))
+						width = std::max(width, GetSize(cell->getPort(port)));
+				logic_bits += width;
+				if (logic_cells >= 1024 || logic_bits >= 8192)
+					return true;
+			}
+		}
+		return false;
+	}
+
 	void script() override
 	{
 		if (check_label("begin")) {
@@ -218,17 +275,26 @@ struct SynthIntelPass : public ScriptPass {
 			run("check");
 			run("opt_pmuxprep -nodffe -nosdff");
 			run("fsm");
-			run("opt_pmuxprep");
+			bool full_coarse = help_mode || has_large_coarse_logic();
+			if (full_coarse) {
+				run("opt_pmuxprep -full");
+			} else {
+				run("opt_pmuxprep");
+			}
 			run("wreduce");
 			run("peepopt");
 			run("opt_clean");
+			run("opt_pmux_state");
+			run("opt_reduce");
 			run("opt_pmux_context");
+			run("opt_pmux_arith");
 			run("opt_pmux_factor");
 			run("opt_pmux_state");
 			run("opt_pmux_rel");
-			// Coalesce equivalent branches before rebuilding selection trees.
-			run("opt_reduce");
 			run("opt_pmux_select");
+			run("opt_pmux_arith");
+			if (!full_coarse)
+				run("opt_share");
 			if (help_mode || has_lut_comparison())
 				run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4", "(if a comparison fits the LUT width)");
 			run("opt_expr");
@@ -248,12 +314,14 @@ struct SynthIntelPass : public ScriptPass {
 			} else {
 				run("alumacc");
 			}
-			run("opt_pmuxprep");
-			run("memory -nomap");
-			run("opt_clean");
+			if (help_mode || has_memory()) {
+				run("opt_pmuxprep");
+				run("memory -nomap");
+				run("opt_clean");
+			}
 		}
 
-		if (!nobram && check_label("map_bram", "(skip if -nobram)")) {
+		if (!nobram && check_label("map_bram", "(skip if -nobram)") && (help_mode || has_memory())) {
 				if (family_opt == "cycloneiv" ||
 				    family_opt == "cycloneive" ||
 				    family_opt == "max10" ||
@@ -267,10 +335,12 @@ struct SynthIntelPass : public ScriptPass {
 
 		if (check_label("map_ffram")) {
 			run("opt_pmuxprep -fast -mux_undef -undriven -fine -full");
-			run("memory_map");
-			run("opt_pmuxprep -undriven -fine");
+			if (help_mode || has_memory()) {
+				run("memory_map");
+				run("opt_pmuxprep -undriven -fine");
+			}
 			run("techmap -map +/techmap.v");
-			run("opt_pmuxprep -full");
+			run("opt_pmuxprep -fast -full");
 			run("clean -purge");
 			run("setundef -undriven -zero");
 		}
@@ -281,7 +351,27 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			run("abc9 -lut 4 -W 300 -script +&scorr;&sweep;&dc2;&b;&syn2,-m;&b;&blut,-K,4;&if,-a,-F,4,-A,4" + string(dff ? " -dff" : ""));
+			bool large_logic = !help_mode && has_large_logic_module();
+			bool very_large_logic = large_logic && has_large_logic_module(4096);
+			bool area_refine = large_logic && !dff && !has_abc9_boxes();
+			std::string abc_script = "+&scorr;&sweep;&dc2;";
+			if (area_refine)
+				abc_script += "&b;";
+			if (!large_logic)
+				abc_script += "&saveaig;&b;&syn2,-m;&b;&if,-a,-F,1,-A,1;&save,-a;&loadaig;";
+			abc_script += "&dch,-f,-r;";
+			abc_script += very_large_logic ? "&if,-a,-F,4,-A,4" :
+				large_logic ? "&if,-a,-F,2,-A,2" : "&if,-a,-F,1,-A,2";
+			abc_script += ";&save,-a;&load";
+			if (area_refine) {
+				abc_script += ";&put;";
+				if (very_large_logic)
+					abc_script += "mfs2,-a,-W,2,-M,200,-C,1000;lutpack,-N,4,-Q,1,-S,2,-L,10,-s;";
+				else
+					abc_script += "lutpack,-N,2,-Q,1,-S,2,-L,10,-s;";
+				abc_script += "&get,-m;&save,-a;&load";
+			}
+			run("abc9 -lut 4 -W 300 -script " + abc_script + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt_pmuxprep -fast");
 			run("autoname");

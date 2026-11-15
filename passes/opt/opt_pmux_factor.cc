@@ -786,9 +786,9 @@ struct OptPmuxFactorPass : public Pass
 		extra_args(args, 1, design);
 		pmux_run_pass(design, "opt_pmux_factor", "Executing OPT_PMUX_FACTOR pass.\n", [](Module *module) {
 			PmuxCoarseIndex index(module);
-			int rewrites = factor_reductions(index);
+			int rewrites = factor_local_choices(index);
 			rewrites += factor_joint_choices(index);
-			return rewrites + factor_local_choices(index);
+			return rewrites + factor_reductions(index);
 		});
 	}
 } OptPmuxFactorPass;

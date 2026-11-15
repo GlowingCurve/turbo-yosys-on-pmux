@@ -921,6 +921,14 @@ struct OptPmuxArithPass : public Pass
 				if (design->module(cell->type))
 					instantiated.insert(cell->type);
 		pmux_run_pass(design, "opt_pmux_arith", "Executing OPT_PMUX_ARITH pass.\n", [&](Module *module) {
+			bool has_candidate = false;
+			for (auto cell : module->cells())
+				if (arithmetic_type(cell->type) || cell->type.in(ID($mod), ID($modfloor), ID($lt), ID($gt))) {
+					has_candidate = true;
+					break;
+				}
+			if (!has_candidate)
+				return 0;
 			PmuxCoarseIndex index(module);
 			bool external_inputs = !instantiated.count(module->name);
 			int changes = 0;
