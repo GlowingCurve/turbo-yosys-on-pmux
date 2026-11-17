@@ -303,6 +303,75 @@ class SelectWorker
 		return forward;
 	}
 
+	std::unique_ptr<PmuxRewrite> preserve_shared_control(const std::vector<SelectNetwork> &networks,
+			const PmuxEncoding &encoding, PmuxRewrite &original)
+	{
+		if (encoding.controls().size() == pmux_max_controls)
+			return nullptr;
+		std::optional<SigBit> data_control;
+		int width = 0;
+		auto input = [&](SigBit bit) { return !bit.wire || index.module_input(bit); };
+		for (const auto &network : networks) {
+			width += GetSize(network.y);
+			for (const auto &data : {network.a, network.b})
+				for (auto bit : data) {
+					if (input(bit))
+						continue;
+					auto source = index.source(bit);
+					if (!source || source->port != ID::Y || source->cell->type != ID($mux) || !pmux_select_shape(source->cell))
+						return nullptr;
+					auto cell = source->cell;
+					if (!input(index.port(cell, ID::A)[source->offset]) || !input(index.port(cell, ID::B)[source->offset]))
+						return nullptr;
+					auto select = index.port(cell, ID::S)[0];
+					if (data_control && *data_control != select)
+						return nullptr;
+					data_control = select;
+				}
+		}
+		if (!data_control)
+			return nullptr;
+		auto control_source = index.source(*data_control);
+		if (!control_source || !control_source->cell->type.in(ID($xor), ID($xnor)))
+			return nullptr;
+		PmuxEncoding expanded(encoding);
+		// 将已共享的奇偶控制作为独立变量保留。
+		if (!expanded.pin(*data_control) || expanded.controls().size() == encoding.controls().size() ||
+				width > pmux_max_table_bits / pmux_encoding_limit(GetSize(expanded.controls())))
+			return nullptr;
+		std::vector<SigSpec> selects;
+		for (const auto &network : networks)
+			selects.push_back(network.select);
+		std::vector<std::vector<int>> tables;
+		if (!expanded.branch_tables(selects, tables))
+			return nullptr;
+		auto expanded_networks = networks;
+		for (int pos = 0; pos < GetSize(networks); ++pos)
+			expanded_networks[pos].branches = std::move(tables[pos]);
+		auto rewrite = rebuild(expanded_networks, expanded, true);
+		if (!rewrite || logic_cost(*rewrite) >= logic_cost(original))
+			return nullptr;
+		log_debug("PMUX shared_parity_control in %s: selected (gate cost %d -> %d).\n",
+			log_id(module), logic_cost(original), logic_cost(*rewrite));
+		return rewrite;
+	}
+
+	static int logic_cost(PmuxRewrite &rewrite)
+	{
+		auto cell_cost = [](Cell *cell) {
+			int width = GetSize(cell->getPort(ID::Y));
+			if (cell->type == ID($pmux))
+				return width * (2 * GetSize(cell->getPort(ID::S)) - 1);
+			return width * (cell->type.in(ID($mux), ID($xor), ID($xnor)) ? 3 : 1);
+		};
+		int cost = 0;
+		for (auto cell : rewrite.staging.cells())
+			cost += cell_cost(cell);
+		for (auto cell : rewrite.removed)
+			cost -= cell_cost(cell);
+		return cost;
+	}
+
 	dict<Cell *, std::array<bool, 2>> foldable_mux_arms(const std::vector<SelectNetwork> &networks, const PmuxEncoding &encoding)
 	{
 		std::vector<const SelectNetwork *> muxes;
@@ -520,6 +589,9 @@ class SelectWorker
 						rewrite = keep_decode(networks, *encoding, *shared_decode);
 				} else {
 					rewrite = rebuild(networks, *encoding, rule == Rule::specialize);
+					if (rule == Rule::specialize && rewrite)
+						if (auto shared = preserve_shared_control(networks, *encoding, *rewrite))
+							rewrite = std::move(shared);
 				}
 				if (!rewrite)
 					continue;

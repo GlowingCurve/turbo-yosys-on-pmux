@@ -499,6 +499,11 @@ class RelationWorker
 		if (roots.empty())
 			return nullptr;
 		auto live = tree.analyze(roots);
+		bool shared_control = std::all_of(tables.begin(), tables.end(), [&](const auto &table) {
+			return table.cell->type == ID($mux) && table.control == tables.front().control;
+		});
+		if (!partial && shared_control && live.mux_bits > GetSize(swap_y))
+			return nullptr;
 		if (partial && live.mux_bits >= tree.analyze(reference).mux_bits)
 			return nullptr;
 		auto rewrite = std::make_unique<PmuxRewrite>(module, index, "encoded_output_swap");
