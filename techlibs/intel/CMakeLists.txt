@@ -3,6 +3,7 @@ yosys_pass(synth_intel
 	REQUIRES
 		abc
 		abc9
+		alumacc
 		autoname
 		blackbox
 		check
@@ -19,6 +20,15 @@ yosys_pass(synth_intel
 		opt
 		opt_clean
 		opt_expr
+		opt_reduce
+		opt_share
+		opt_pmuxprep
+		opt_pmux_state
+		opt_pmux_context
+		opt_pmux_arith
+		opt_pmux_factor
+		opt_pmux_rel
+		opt_pmux_select
 		peepopt
 		proc
 		read_verilog

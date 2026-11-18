@@ -26,12 +26,14 @@
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
+// 注册 Intel FPGA 的综合流程。
 struct SynthIntelPass : public ScriptPass {
+	// 将 synth_intel 注册为实验性脚本命令。
 	SynthIntelPass() : ScriptPass("synth_intel", "synthesis for Intel (Altera) FPGAs.") { experimental(); }
 
+	// 显示器件、输出文件和映射选项。
 	void help() override
 	{
-		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
 		log("\n");
 		log("    synth_intel [options]\n");
 		log("\n");
@@ -58,27 +60,7 @@ struct SynthIntelPass : public ScriptPass {
 		log("        file is not compatible with the Quartus flow. Writing of an\n");
 		log("        output file is omitted if this parameter is not specified.\n");
 		log("\n");
-		log("    -run <from_label>:<to_label>\n");
-		log("        only run the commands between the labels (see below). an empty\n");
-		log("        from label is synonymous to 'begin', and empty to label is\n");
-		log("        synonymous to the end of the command list.\n");
-		log("\n");
-		log("    -dff\n");
-		log("        pass DFFs to ABC to perform sequential logic optimisations\n");
-		log("        (EXPERIMENTAL)\n");
-		log("\n");
-		log("    -iopads\n");
-		log("        use IO pad cells in output netlist\n");
-		log("\n");
-		log("    -nobram\n");
-		log("        do not use block RAM cells in output netlist\n");
-		log("\n");
-		log("    -nodsp\n");
-		log("        do not map multipliers to MUL18/MUL9 cells\n");
-		log("\n");
-		log("    -noflatten\n");
-		log("        do not flatten design before synthesis\n");
-		log("\n");
+		help_mapping_options();
 		log("The following commands are executed by this synthesis command:\n");
 		help_script();
 		log("\n");
@@ -87,6 +69,7 @@ struct SynthIntelPass : public ScriptPass {
 	string top_opt, family_opt, vout_file, blif_file;
 	bool flatten, nobram, dff, nodsp, iopads;
 
+	// 恢复器件、顶层模块和映射选项的默认值。
 	void clear_flags() override
 	{
 		top_opt = "-auto-top";
@@ -100,64 +83,13 @@ struct SynthIntelPass : public ScriptPass {
 		iopads = false;
 	}
 
+	// 解析综合范围和目标器件，执行相应阶段。
 	void execute(std::vector<std::string> args, RTLIL::Design *design) override
 	{
 		string run_from, run_to;
 		clear_flags();
 
-		size_t argidx;
-		for (argidx = 1; argidx < args.size(); argidx++) {
-			if (args[argidx] == "-family" && argidx + 1 < args.size()) {
-				family_opt = args[++argidx];
-				continue;
-			}
-			if (args[argidx] == "-top" && argidx + 1 < args.size()) {
-				top_opt = "-top " + args[++argidx];
-				continue;
-			}
-			if (args[argidx] == "-vqm" && argidx + 1 < args.size()) {
-				vout_file = args[++argidx];
-				log_warning("The Quartus backend has not been tested recently and is likely incompatible with modern versions of Quartus.\n");
-				continue;
-			}
-			if (args[argidx] == "-vpr" && argidx + 1 < args.size()) {
-				blif_file = args[++argidx];
-				continue;
-			}
-			if (args[argidx] == "-run" && argidx + 1 < args.size()) {
-				size_t pos = args[argidx + 1].find(':');
-				if (pos == std::string::npos)
-					break;
-				run_from = args[++argidx].substr(0, pos);
-				run_to = args[argidx].substr(pos + 1);
-				continue;
-			}
-			if (args[argidx] == "-iopads") {
-				iopads = true;
-				continue;
-			}
-			if (args[argidx] == "-dff") {
-				dff = true;
-				continue;
-			}
-			if (args[argidx] == "-nodsp") {
-				nodsp = true;
-				continue;
-			}
-			if (args[argidx] == "-nobram") {
-				nobram = true;
-				continue;
-			}
-			if (args[argidx] == "-noflatten") {
-				flatten = false;
-				continue;
-			}
-			if (args[argidx] == "-retime") {
-				// Removed: ABC9 does not support retiming.
-				continue;
-			}
-			break;
-		}
+		size_t argidx = parse_options(args, run_from, run_to);
 		extra_args(args, argidx, design);
 
 		if (!design->full_selection())
@@ -166,10 +98,7 @@ struct SynthIntelPass : public ScriptPass {
 		if (family_opt == "cyclonev")
 			log_cmd_error("Cyclone V synthesis has been moved to synth_intel_alm.\n");
 
-		if (family_opt != "max10" &&
-		    family_opt != "cycloneiv" &&
-		    family_opt != "cycloneive" &&
-		    family_opt != "cyclone10lp")
+		if (family_opt != "max10" && family_opt != "cycloneiv" && family_opt != "cycloneive" && family_opt != "cyclone10lp")
 			log_cmd_error("Invalid or no family specified: '%s'\n", family_opt);
 
 		if (family_opt != "max10")
@@ -183,6 +112,7 @@ struct SynthIntelPass : public ScriptPass {
 		log_pop();
 	}
 
+	// 检查是否存在适合查找表实现的比较器。
 	bool has_lut_comparison() const
 	{
 		for (auto module : active_design->selected_unboxed_modules())
@@ -193,19 +123,21 @@ struct SynthIntelPass : public ScriptPass {
 		return false;
 	}
 
+	// 检查模块中是否仍有存储器需要映射。
 	bool has_memory() const
 	{
 		for (auto module : active_design->selected_unboxed_modules()) {
 			if (!module->memories.empty())
 				return true;
 			for (auto cell : module->cells())
-				if (cell->type.in(ID($mem), ID($mem_v2), ID($memrd), ID($memrd_v2),
-						ID($memwr), ID($memwr_v2), ID($meminit), ID($meminit_v2)))
+				if (cell->type.in(ID($mem), ID($mem_v2), ID($memrd), ID($memrd_v2), ID($memwr), ID($memwr_v2), ID($meminit),
+						  ID($meminit_v2)))
 					return true;
 		}
 		return false;
 	}
 
+	// 检查设计中是否含有 ABC9 的专用单元。
 	bool has_abc9_boxes() const
 	{
 		for (auto module : active_design->modules()) {
@@ -218,6 +150,7 @@ struct SynthIntelPass : public ScriptPass {
 		return false;
 	}
 
+	// 检查是否有模块达到指定的逻辑规模。
 	bool has_large_logic_module(int min_cells = 1024) const
 	{
 		for (auto module : active_design->selected_unboxed_modules()) {
@@ -229,6 +162,7 @@ struct SynthIntelPass : public ScriptPass {
 		return false;
 	}
 
+	// 统计粗粒度单元，决定是否执行完整优化。
 	bool has_large_coarse_logic() const
 	{
 		for (auto module : active_design->selected_unboxed_modules()) {
@@ -250,6 +184,7 @@ struct SynthIntelPass : public ScriptPass {
 		return false;
 	}
 
+	// 按阶段读取器件模型并完成粗粒度综合与映射。
 	void script() override
 	{
 		if (check_label("begin")) {
@@ -262,70 +197,159 @@ struct SynthIntelPass : public ScriptPass {
 			run(stringf("hierarchy -check %s", help_mode ? "-top <top>" : top_opt));
 		}
 
-		if (check_label("coarse")) {
-			run("proc");
-			if (flatten || help_mode) {
-				run("check");
-				run("flatten", "(skip if -noflatten)");
-			}
-			run("tribuf -logic");
-			run("deminout");
-			run("opt_expr");
-			run("opt_clean");
-			run("check");
-			run("opt_pmuxprep -nodffe -nosdff");
-			run("fsm");
-			bool full_coarse = help_mode || has_large_coarse_logic();
-			if (full_coarse) {
-				run("opt_pmuxprep -full");
-			} else {
-				run("opt_pmuxprep");
-			}
-			run("wreduce");
-			run("peepopt");
-			run("opt_clean");
-			run("opt_pmux_state");
-			run("opt_reduce");
-			run("opt_pmux_context");
-			run("opt_pmux_arith");
-			run("opt_pmux_factor");
-			run("opt_pmux_state");
-			run("opt_pmux_rel");
-			run("opt_pmux_select");
-			run("opt_pmux_arith");
-			if (!full_coarse)
-				run("opt_share");
-			if (help_mode || has_lut_comparison())
-				run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4", "(if a comparison fits the LUT width)");
-			run("opt_expr");
-			run("opt_clean");
+		if (check_label("coarse"))
+			run_coarse();
+		run_mapping();
+		run_output();
+	}
 
-			if (help_mode) {
-				run("techmap -map +mul2dsp.v [...]", "(unless -nodsp)");
-			} else if (!nodsp) {
-				run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=10 -D DSP_B_MINWIDTH=4 -D DSP_NAME=$__MUL18X18");
-					run("chtype -set $mul t:$__soft_mul");
-					run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=10 -D DSP_NAME=$__MUL18X18");
-					run("chtype -set $mul t:$__soft_mul");
-					run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=9 -D DSP_B_MAXWIDTH=9  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=4 -D DSP_NAME=$__MUL9X9");
-					run("chtype -set $mul t:$__soft_mul");
-				run("alumacc");
-				run(stringf("techmap -map +/intel/%s/dsp_map.v", family_opt));
-			} else {
-				run("alumacc");
+      private:
+	// 显示综合阶段与器件映射选项。
+	void help_mapping_options() const
+	{
+		log("    -run <from_label>:<to_label>\n");
+		log("        only run the commands between the labels (see below). an empty\n");
+		log("        from label is synonymous to 'begin', and empty to label is\n");
+		log("        synonymous to the end of the command list.\n");
+		log("\n");
+		log("    -dff\n");
+		log("        pass DFFs to ABC to perform sequential logic optimisations\n");
+		log("        (EXPERIMENTAL)\n");
+		log("\n");
+		log("    -iopads\n");
+		log("        use IO pad cells in output netlist\n");
+		log("\n");
+		log("    -nobram\n");
+		log("        do not use block RAM cells in output netlist\n");
+		log("\n");
+		log("    -nodsp\n");
+		log("        do not map multipliers to MUL18/MUL9 cells\n");
+		log("\n");
+		log("    -noflatten\n");
+		log("        do not flatten design before synthesis\n");
+		log("\n");
+	}
+
+	// 识别无参数的器件映射选项。
+	bool parse_mapping_flag(const std::string &arg)
+	{
+		if (arg == "-iopads")
+			iopads = true;
+		else if (arg == "-dff")
+			dff = true;
+		else if (arg == "-nodsp")
+			nodsp = true;
+		else if (arg == "-nobram")
+			nobram = true;
+		else if (arg == "-noflatten")
+			flatten = false;
+		else if (arg != "-retime")
+			return false;
+		return true;
+	}
+
+	// 读取目标器件、文件名和执行范围。
+	size_t parse_options(const std::vector<std::string> &args, string &run_from, string &run_to)
+	{
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++) {
+			if (args[argidx] == "-family" && argidx + 1 < args.size()) {
+				family_opt = args[++argidx];
+				continue;
 			}
-			if (help_mode || has_memory()) {
-				run("opt_pmuxprep");
-				run("memory -nomap");
-				run("opt_clean");
+			if (args[argidx] == "-top" && argidx + 1 < args.size()) {
+				top_opt = "-top " + args[++argidx];
+				continue;
 			}
+			if (args[argidx] == "-vqm" && argidx + 1 < args.size()) {
+				vout_file = args[++argidx];
+				log_warning(
+				  "The Quartus backend has not been tested recently and is likely incompatible with modern versions of Quartus.\n");
+				continue;
+			}
+			if (args[argidx] == "-vpr" && argidx + 1 < args.size()) {
+				blif_file = args[++argidx];
+				continue;
+			}
+			if (args[argidx] == "-run" && argidx + 1 < args.size()) {
+				size_t pos = args[argidx + 1].find(':');
+				if (pos == std::string::npos)
+					break;
+				run_from = args[++argidx].substr(0, pos);
+				run_to = args[argidx].substr(pos + 1);
+				continue;
+			}
+			if (!parse_mapping_flag(args[argidx]))
+				break;
 		}
+		return argidx;
+	}
 
+	// 将乘法器映射到目标器件的 DSP 单元。
+	void run_dsp_mapping()
+	{
+		if (help_mode) {
+			run("techmap -map +mul2dsp.v [...]", "(unless -nodsp)");
+		} else if (!nodsp) {
+			run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=10 -D DSP_B_MINWIDTH=4 -D "
+			    "DSP_NAME=$__MUL18X18");
+			run("chtype -set $mul t:$__soft_mul");
+			run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=18 -D DSP_B_MAXWIDTH=18  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=10 -D "
+			    "DSP_NAME=$__MUL18X18");
+			run("chtype -set $mul t:$__soft_mul");
+			run("techmap -map +/mul2dsp.v -D DSP_A_MAXWIDTH=9 -D DSP_B_MAXWIDTH=9  -D DSP_A_MINWIDTH=4 -D DSP_B_MINWIDTH=4 -D "
+			    "DSP_NAME=$__MUL9X9");
+			run("chtype -set $mul t:$__soft_mul");
+			run("alumacc");
+			run(stringf("techmap -map +/intel/%s/dsp_map.v", family_opt));
+		} else {
+			run("alumacc");
+		}
+	}
+
+	// 在粗粒度网表上依次化简控制、算术和存储器。
+	void run_coarse()
+	{
+		run("proc");
+		if (flatten || help_mode) {
+			run("check");
+			run("flatten", "(skip if -noflatten)");
+		}
+		run("tribuf -logic");
+		run("deminout");
+		run("opt_expr");
+		run("opt_clean");
+		run("check");
+		run("opt_pmuxprep -nodffe -nosdff");
+		run("fsm");
+		bool full_coarse = help_mode || has_large_coarse_logic();
+		if (full_coarse) {
+			run("opt_pmuxprep -full");
+		} else {
+			run("opt_pmuxprep");
+		}
+		run("wreduce");
+		run("peepopt");
+		run("opt_clean");
+		run_pmux_coarse_passes(full_coarse);
+		if (help_mode || has_lut_comparison())
+			run("techmap -map +/cmp2lut.v -D LUT_WIDTH=4", "(if a comparison fits the LUT width)");
+		run("opt_expr");
+		run("opt_clean");
+
+		run_dsp_mapping();
+		if (help_mode || has_memory()) {
+			run("opt_pmuxprep");
+			run("memory -nomap");
+			run("opt_clean");
+		}
+	}
+
+	// 执行存储器、触发器和 LUT 映射阶段。
+	void run_mapping()
+	{
 		if (!nobram && check_label("map_bram", "(skip if -nobram)") && (help_mode || has_memory())) {
-				if (family_opt == "cycloneiv" ||
-				    family_opt == "cycloneive" ||
-				    family_opt == "max10" ||
-				    help_mode) {
+			if (family_opt == "cycloneiv" || family_opt == "cycloneive" || family_opt == "max10" || help_mode) {
 				run("memory_bram -rules +/intel/common/brams_m9k.txt", "(if applicable for family)");
 				run("techmap -map +/intel/common/brams_map_m9k.v", "(if applicable for family)");
 			} else {
@@ -351,33 +375,17 @@ struct SynthIntelPass : public ScriptPass {
 		}
 
 		if (check_label("map_luts")) {
-			bool large_logic = !help_mode && has_large_logic_module();
-			bool very_large_logic = large_logic && has_large_logic_module(4096);
-			bool area_refine = large_logic && !dff && !has_abc9_boxes();
-			std::string abc_script = "+&scorr;&sweep;&dc2;";
-			if (area_refine)
-				abc_script += "&b;";
-			if (!large_logic)
-				abc_script += "&saveaig;&b;&syn2,-m;&b;&if,-a,-F,1,-A,1;&save,-a;&loadaig;";
-			abc_script += "&dch,-f,-r;";
-			abc_script += very_large_logic ? "&if,-a,-F,4,-A,4" :
-				large_logic ? "&if,-a,-F,2,-A,2" : "&if,-a,-F,1,-A,2";
-			abc_script += ";&save,-a;&load";
-			if (area_refine) {
-				abc_script += ";&put;";
-				if (very_large_logic)
-					abc_script += "mfs2,-a,-W,2,-M,200,-C,1000;lutpack,-N,4,-Q,1,-S,2,-L,10,-s;";
-				else
-					abc_script += "lutpack,-N,2,-Q,1,-S,2,-L,10,-s;";
-				abc_script += "&get,-m;&save,-a;&load";
-			}
-			run("abc9 -lut 4 -W 300 -script " + abc_script + string(dff ? " -dff" : ""));
+			run("abc9 -lut 4 -W 300 -script " + build_abc9_script() + string(dff ? " -dff" : ""));
 			run("clean");
 			run("opt_pmuxprep -fast");
 			run("autoname");
 			run("clean");
 		}
+	}
 
+	// 连接引脚，检查最终网表并写出用户指定的文件。
+	void run_output()
+	{
 		if (check_label("map_cells")) {
 			if (iopads || help_mode)
 				run("iopadmap -bits -outpad $__outpad I:O -inpad $__inpad O:I", "(if -iopads)");
@@ -404,6 +412,58 @@ struct SynthIntelPass : public ScriptPass {
 				run(stringf("write_blif %s", help_mode ? "<file-name>" : blif_file));
 			}
 		}
+	}
+
+	// 按粗粒度综合顺序依次执行 PMUX 优化。
+	void run_pmux_coarse_passes(bool full_coarse)
+	{
+		// 简化状态与控制信号。
+		run("opt_pmux_state");
+		run("opt_reduce");
+		// 化简单个选择器及其分支中的运算。
+		run("opt_pmux_context");
+		run("opt_pmux_arith");
+		run("opt_pmux_factor");
+		run("opt_pmux_state");
+		// 共享输出并重建选择树。
+		run("opt_pmux_rel");
+		run("opt_pmux_select");
+		run("opt_pmux_arith");
+		if (!full_coarse)
+			run("opt_share");
+	}
+
+	// 根据模块规模选择 LUT4 映射与面积优化命令。
+	std::string build_abc9_script() const
+	{
+		bool large_logic = !help_mode && has_large_logic_module();
+		bool very_large_logic = large_logic && has_large_logic_module(4096);
+		bool area_refine = large_logic && !dff && !has_abc9_boxes();
+		// 公共 AIG 压缩前缀。
+		std::string abc_script = "+&scorr;&sweep;&dc2;";
+		if (area_refine)
+			abc_script += "&b;";
+		if (!large_logic)
+			abc_script += "&saveaig;&b;&syn2,-m;&b;&if,-a,-F,1,-A,1;&save,-a;&loadaig;";
+		abc_script += "&dch,-f,-r;";
+		// 根据组合逻辑规模选择三种映射搜索预算。
+		if (very_large_logic)
+			abc_script += "&if,-a,-F,4,-A,4";
+		else if (large_logic)
+			abc_script += "&if,-a,-F,2,-A,2";
+		else
+			abc_script += "&if,-a,-F,1,-A,2";
+		// 比较保存的映射结果，并在允许时继续优化面积。
+		abc_script += ";&save,-a;&load";
+		if (area_refine) {
+			abc_script += ";&put;";
+			if (very_large_logic)
+				abc_script += "mfs2,-a,-W,2,-M,200,-C,1000;lutpack,-N,4,-Q,1,-S,2,-L,10,-s;";
+			else
+				abc_script += "lutpack,-N,2,-Q,1,-S,2,-L,10,-s;";
+			abc_script += "&get,-m;&save,-a;&load";
+		}
+		return abc_script;
 	}
 } SynthIntelPass;
 

@@ -121,16 +121,3 @@ yosys_pass(peepopt
 	peepopt.cc
 	${PMGEN_peepopt_OUTPUT}
 )
-
-# Link the PMUX passes through synth_intel's peepopt dependency in a selective build.
-if (synth_intel IN_LIST YOSYS_COMPONENTS)
-	set_property(TARGET yosys_peepopt APPEND PROPERTY YOSYS_REQUIRES
-		opt_pmux_context
-		opt_pmux_arith
-		opt_pmux_factor
-		opt_pmux_state
-		opt_pmux_rel
-		opt_pmux_select
-		opt_pmuxprep
-	)
-endif()
